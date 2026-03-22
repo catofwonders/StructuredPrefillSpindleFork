@@ -77,6 +77,7 @@ const DEFAULT_SETTINGS: Settings = {
 // ─── State ───────────────────────────────────────────────────────────────────
 
 let settings: Settings = { ...DEFAULT_SETTINGS }
+let currentUserId: string | undefined
 
 const state: RuntimeState = {
   active: false,
@@ -810,11 +811,23 @@ async function runPrefillGenerator(messages: LlmMessageDTO[], tailIndex: number)
 spindle.registerInterceptor(async (messages: LlmMessageDTO[], context: any) => {
   if (!settings.enabled) return messages
 
-  // Extract generation metadata from context
-  const generationType = String(context?.generationType ?? context?.type ?? '').toLowerCase()
-  const provider = String(context?.provider ?? context?.chat_completion_source ?? '').toLowerCase()
-  const modelId = String(context?.model ?? '')
-  const chatId = String(context?.chatId ?? '')
+  // Extract generation metadata from context — try multiple possible property names
+  // (Lumiverse may use different names than what we expect)
+  const generationType = String(context?.generationType ?? context?.type ?? context?.generation_type ?? '').toLowerCase()
+  const provider = String(context?.provider ?? context?.chat_completion_source ?? context?.source ?? '').toLowerCase()
+  const modelId = String(context?.model ?? context?.modelId ?? '')
+  const chatId = String(context?.chatId ?? context?.chat_id ?? '')
+
+  // Diagnostic: log what we got from context so we can debug if things aren't working
+  spindle.log.info(`[SP] Interceptor fired: type=${generationType} provider=${provider} model=${modelId} chatId=${chatId || '(empty)'}`)
+  
+  // Log context keys on first run so we know what's available
+  if (context && typeof context === 'object') {
+    try {
+      const keys = Object.keys(context).join(', ')
+      spindle.log.info(`[SP] Context keys: ${keys}`)
+    } catch { /* ignore */ }
+  }
 
   // Skip impersonate and quiet generations
   if (generationType === 'impersonate' || generationType === 'quiet') return messages
@@ -931,15 +944,28 @@ spindle.registerInterceptor(async (messages: LlmMessageDTO[], context: any) => {
   const jsonSchema = buildJsonSchemaForPrefillValuePattern(schemaPrefix, minCharsAfterPrefix, joinSuffixRegex, { mustEndAfterTemplate })
 
   // ─── Inject json_schema into the generation context ───
-  // Strategy 1: Mutate context directly (works if Lumiverse passes context by reference)
+  // We try multiple strategies since we're not sure which property Lumiverse checks.
+  // The Generation docs show `parameters.response_format` works for spindle.generate.raw(),
+  // so the interceptor context likely uses a similar structure.
   if (context && typeof context === 'object') {
-    // OpenAI-compatible response_format injection
+    // Strategy 1: OpenAI-compatible response_format (most likely)
     context.response_format = {
       type: 'json_schema',
       json_schema: jsonSchema,
     }
-    // Also set as top-level json_schema for Lumiverse's own handling
+    // Strategy 2: Top-level json_schema (SillyTavern style)
     context.json_schema = jsonSchema
+    // Strategy 3: Nested in parameters (mirrors spindle.generate.raw behavior)
+    if (!context.parameters) context.parameters = {}
+    context.parameters.response_format = {
+      type: 'json_schema',
+      json_schema: jsonSchema,
+    }
+    
+    spindle.log.info(`[SP] Injected json_schema via context.response_format, context.json_schema, and context.parameters.response_format`)
+  } else {
+    spindle.log.warn(`[SP] Context is not an object — cannot inject json_schema!`)
+    return messages // bail, can't do anything without context mutation
   }
 
   // Activate runtime state
@@ -1024,13 +1050,22 @@ spindle.on('GENERATION_ENDED', async (payload) => {
     try {
       const granted = await spindle.permissions.getGranted()
       if (granted.includes('chat_mutation')) {
-        // Update the message content with the decoded (non-JSON) text
-        await (spindle as any).chatMutation?.update?.(messageId, {
-          content: finalText,
-        })
+        // Try different possible API shapes for chat mutation
+        const chatMut = (spindle as any).chatMutation ?? (spindle as any).chat_mutation ?? (spindle as any).messages
+        if (chatMut?.update) {
+          await chatMut.update(messageId, { content: finalText })
+          spindle.log.info(`[SP] Applied decoded text to message ${messageId} via chatMutation.update`)
+        } else if (chatMut?.updateMessage) {
+          await chatMut.updateMessage(messageId, { content: finalText })
+          spindle.log.info(`[SP] Applied decoded text to message ${messageId} via chatMutation.updateMessage`)
+        } else {
+          spindle.log.warn(`[SP] chat_mutation permission granted but no update method found. Available: ${chatMut ? Object.keys(chatMut).join(', ') : 'null'}`)
+        }
+      } else {
+        spindle.log.info(`[SP] chat_mutation not granted — decoded text sent to frontend only`)
       }
     } catch (err) {
-      spindle.log.warn(`Failed to apply decoded text via chat_mutation: ${err}`)
+      spindle.log.warn(`[SP] Failed to apply decoded text via chat_mutation: ${err}`)
     }
   }
 
@@ -1082,6 +1117,12 @@ spindle.on('GENERATION_STOPPED', async (payload) => {
 // ─── Frontend Message Handler ────────────────────────────────────────────────
 
 spindle.onFrontendMessage(async (payload: any, userId) => {
+  // Capture userId for operator-scoped extensions (lesson from Mode Toggles port)
+  if (userId && userId !== currentUserId) {
+    spindle.log.info(`[SP] Captured userId from frontend: ${userId}`)
+    currentUserId = userId
+  }
+
   switch (payload?.type) {
     case 'get_settings': {
       spindle.sendToFrontend({ type: 'settings', settings })
@@ -1100,10 +1141,11 @@ spindle.onFrontendMessage(async (payload: any, userId) => {
 
     case 'get_connections': {
       try {
-        const connections = await spindle.connections.list()
+        // Pass userId for operator-scoped extensions
+        const connections = await spindle.connections.list(currentUserId)
         spindle.sendToFrontend({ type: 'connections', connections })
       } catch (err) {
-        spindle.log.warn(`Failed to list connections: ${err}`)
+        spindle.log.warn(`[SP] Failed to list connections: ${err}`)
         spindle.sendToFrontend({ type: 'connections', connections: [] })
       }
       break
@@ -1124,5 +1166,14 @@ spindle.onFrontendMessage(async (payload: any, userId) => {
 
 ;(async () => {
   await loadSettings()
-  spindle.log.info(`${EXT_NAME} backend loaded (v1.0.0)`)
+  
+  // Log available APIs for debugging
+  try {
+    const granted = await spindle.permissions.getGranted()
+    spindle.log.info(`[SP] Granted permissions: [${granted.join(', ')}]`)
+  } catch (e) {
+    spindle.log.warn(`[SP] Could not check permissions: ${e}`)
+  }
+
+  spindle.log.info(`[SP] ${EXT_NAME} backend loaded (v1.0.0) — settings.enabled=${settings.enabled}`)
 })()
