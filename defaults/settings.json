@@ -1,0 +1,16 @@
+{
+  "enabled": true,
+  "hide_prefill_in_display": true,
+  "newline_token": "\\n",
+  "min_chars_after_prefix": 80,
+  "continue_overlap_chars": 14,
+  "anti_slop_ban_list": "",
+  "prefill_gen_enabled": false,
+  "prefill_gen_extra_prompt": "",
+  "prefill_gen_extra_prompt_role": "system",
+  "prefill_gen_connection_id": "",
+  "prefill_gen_max_tokens": 15,
+  "prefill_gen_stop": "",
+  "prefill_gen_keep_matched_stop_string": false,
+  "prefill_gen_timeout_ms": 120000
+}
