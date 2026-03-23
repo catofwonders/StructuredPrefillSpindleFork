@@ -1,1 +1,1 @@
-current paused due to limitations in lumiverse code
+currently paused due to limitations in lumiverse code
