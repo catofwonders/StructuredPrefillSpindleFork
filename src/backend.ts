@@ -109,9 +109,13 @@ const state: RuntimeState = {
 
 // ─── Settings I/O ────────────────────────────────────────────────────────────
 
+let settingsLoaded = false
+
 async function loadSettings(): Promise<void> {
+  if (settingsLoaded) return
   try {
-    settings = await spindle.storage.getJson<Settings>('settings.json', {
+    // Use userStorage (per-user) instead of storage (shared) for operator-scoped compatibility
+    settings = await spindle.userStorage.getJson<Settings>('settings.json', {
       fallback: { ...DEFAULT_SETTINGS },
     })
     // Merge missing keys from defaults
@@ -120,6 +124,7 @@ async function loadSettings(): Promise<void> {
         ;(settings as any)[key] = value
       }
     }
+    settingsLoaded = true
   } catch {
     settings = { ...DEFAULT_SETTINGS }
   }
@@ -127,9 +132,9 @@ async function loadSettings(): Promise<void> {
 
 async function saveSettings(): Promise<void> {
   try {
-    await spindle.storage.setJson('settings.json', settings, { indent: 2 })
+    await spindle.userStorage.setJson('settings.json', settings, { indent: 2 })
   } catch (err) {
-    spindle.log.error(`Failed to save settings: ${err}`)
+    spindle.log.error(`[SP] Failed to save settings: ${err}`)
   }
 }
 
@@ -809,6 +814,9 @@ async function runPrefillGenerator(messages: LlmMessageDTO[], tailIndex: number)
 // ─── Interceptor (Core Hook) ─────────────────────────────────────────────────
 
 spindle.registerInterceptor(async (messages: LlmMessageDTO[], context: any) => {
+  // Ensure settings are loaded (interceptor can fire before frontend connects)
+  if (!settingsLoaded) await loadSettings()
+  
   if (!settings.enabled) return messages
 
   // Extract generation metadata from context — try multiple possible property names
@@ -1046,26 +1054,19 @@ spindle.on('GENERATION_ENDED', async (payload) => {
   state.lastAppliedText = finalText
 
   // Apply final decoded text to the chat message via chat_mutation
-  if (messageId) {
+  if (messageId && state.activeChatId) {
     try {
       const granted = await spindle.permissions.getGranted()
       if (granted.includes('chat_mutation')) {
-        // Try different possible API shapes for chat mutation
-        const chatMut = (spindle as any).chatMutation ?? (spindle as any).chat_mutation ?? (spindle as any).messages
-        if (chatMut?.update) {
-          await chatMut.update(messageId, { content: finalText })
-          spindle.log.info(`[SP] Applied decoded text to message ${messageId} via chatMutation.update`)
-        } else if (chatMut?.updateMessage) {
-          await chatMut.updateMessage(messageId, { content: finalText })
-          spindle.log.info(`[SP] Applied decoded text to message ${messageId} via chatMutation.updateMessage`)
-        } else {
-          spindle.log.warn(`[SP] chat_mutation permission granted but no update method found. Available: ${chatMut ? Object.keys(chatMut).join(', ') : 'null'}`)
-        }
+        // Correct API: spindle.chat.updateMessage(chatId, messageId, { content })
+        // Confirmed from LumiScript extension source
+        await (spindle as any).chat.updateMessage(state.activeChatId, messageId, { content: finalText })
+        spindle.log.info(`[SP] Applied decoded text to message ${messageId} in chat ${state.activeChatId}`)
       } else {
         spindle.log.info(`[SP] chat_mutation not granted — decoded text sent to frontend only`)
       }
     } catch (err) {
-      spindle.log.warn(`[SP] Failed to apply decoded text via chat_mutation: ${err}`)
+      spindle.log.warn(`[SP] Failed to apply decoded text via spindle.chat.updateMessage: ${err}`)
     }
   }
 
@@ -1123,6 +1124,9 @@ spindle.onFrontendMessage(async (payload: any, userId) => {
     currentUserId = userId
   }
 
+  // Lazy-load settings on first message so userId is known (pattern from LumiScript)
+  if (!settingsLoaded) await loadSettings()
+
   switch (payload?.type) {
     case 'get_settings': {
       spindle.sendToFrontend({ type: 'settings', settings })
@@ -1165,7 +1169,8 @@ spindle.onFrontendMessage(async (payload: any, userId) => {
 // ─── Initialization ──────────────────────────────────────────────────────────
 
 ;(async () => {
-  await loadSettings()
+  // Settings are loaded lazily in onFrontendMessage once userId is known.
+  // This avoids read/write path mismatches for operator-scoped extensions.
   
   // Log available APIs for debugging
   try {
@@ -1175,5 +1180,5 @@ spindle.onFrontendMessage(async (payload: any, userId) => {
     spindle.log.warn(`[SP] Could not check permissions: ${e}`)
   }
 
-  spindle.log.info(`[SP] ${EXT_NAME} backend loaded (v1.0.0) — settings.enabled=${settings.enabled}`)
+  spindle.log.info(`[SP] ${EXT_NAME} backend ready`)
 })()
