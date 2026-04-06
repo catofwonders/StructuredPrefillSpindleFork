@@ -819,33 +819,39 @@ spindle.registerInterceptor(async (messages: LlmMessageDTO[], context: any) => {
   
   if (!settings.enabled) return messages
 
-  // Extract generation metadata from context — try multiple possible property names
-  // (Lumiverse may use different names than what we expect)
-  const generationType = String(context?.generationType ?? context?.type ?? context?.generation_type ?? '').toLowerCase()
-  const provider = String(context?.provider ?? context?.chat_completion_source ?? context?.source ?? '').toLowerCase()
-  const modelId = String(context?.model ?? context?.modelId ?? '')
-  const chatId = String(context?.chatId ?? context?.chat_id ?? '')
+  // Extract generation metadata from context
+  // Context fields confirmed: chatId, connectionId, personaId, generationType, activatedWorldInfo
+  const generationType = String(context?.generationType ?? '').toLowerCase()
+  const connectionId = String(context?.connectionId ?? '')
+  const chatId = String(context?.chatId ?? '')
 
-  // Diagnostic: log what we got from context so we can debug if things aren't working
-  spindle.log.info(`[SP] Interceptor fired: type=${generationType} provider=${provider} model=${modelId} chatId=${chatId || '(empty)'}`)
-  
-  // Log context keys on first run so we know what's available
-  if (context && typeof context === 'object') {
-    try {
-      const keys = Object.keys(context).join(', ')
-      spindle.log.info(`[SP] Context keys: ${keys}`)
-    } catch { /* ignore */ }
-  }
+  // Diagnostic: log context on every interceptor call
+  spindle.log.info(`[SP] Interceptor fired: type=${generationType} connectionId=${connectionId} chatId=${chatId || '(empty)'}`)
 
   // Skip impersonate and quiet generations
   if (generationType === 'impersonate' || generationType === 'quiet') return messages
 
-  // Check provider compatibility
-  if (!supportsStructuredPrefillForSource(provider)) return messages
+  // Resolve provider and model from the connection profile
+  let provider = ''
+  let modelId = ''
+  if (connectionId) {
+    try {
+      const conn = await spindle.connections.get(connectionId, currentUserId)
+      if (conn) {
+        provider = String(conn.provider ?? '').toLowerCase()
+        modelId = String(conn.model ?? '')
+        spindle.log.info(`[SP] Resolved connection: provider=${provider} model=${modelId}`)
+      }
+    } catch (err) {
+      spindle.log.warn(`[SP] Could not resolve connection ${connectionId}: ${err}`)
+    }
+  }
 
-  // Don't conflict with existing json_schema or tools
-  if (context?.json_schema || context?.response_format) return messages
-  if (Array.isArray(context?.tools) && context.tools.length > 0) return messages
+  // Check provider compatibility
+  if (!supportsStructuredPrefillForSource(provider)) {
+    spindle.log.info(`[SP] Provider "${provider}" not compatible with structured prefill, skipping`)
+    return messages
+  }
 
   const isContinue = generationType === 'continue'
 
@@ -854,17 +860,11 @@ spindle.registerInterceptor(async (messages: LlmMessageDTO[], context: any) => {
   state.patternMode = getPatternModeForRequest(provider, modelId)
 
   // Collect known character names for [[name]] placeholder
+  // Lumiverse context doesn't provide user/char names directly,
+  // but we can try to get them from the persona and chat
   const names = new Set<string>()
-  const userName = String(context?.user_name ?? '').trim()
-  const charName = String(context?.char_name ?? '').trim()
-  if (userName) names.add(userName)
-  if (charName) names.add(charName)
-  if (Array.isArray(context?.group_names)) {
-    for (const gn of context.group_names) {
-      const n = String(gn ?? '').trim()
-      if (n) names.add(n)
-    }
-  }
+  // TODO: Could resolve names from spindle.personas.getActive() and chat character
+  // For now, [[name]] slot will match any text
   state.knownNames = [...names]
 
   // Find the tail assistant message (prefill)
@@ -951,31 +951,6 @@ spindle.registerInterceptor(async (messages: LlmMessageDTO[], context: any) => {
   const minCharsAfterPrefix = isContinue ? 1 : (mustEndAfterTemplate ? 0 : minCharsSetting)
   const jsonSchema = buildJsonSchemaForPrefillValuePattern(schemaPrefix, minCharsAfterPrefix, joinSuffixRegex, { mustEndAfterTemplate })
 
-  // ─── Inject json_schema into the generation context ───
-  // We try multiple strategies since we're not sure which property Lumiverse checks.
-  // The Generation docs show `parameters.response_format` works for spindle.generate.raw(),
-  // so the interceptor context likely uses a similar structure.
-  if (context && typeof context === 'object') {
-    // Strategy 1: OpenAI-compatible response_format (most likely)
-    context.response_format = {
-      type: 'json_schema',
-      json_schema: jsonSchema,
-    }
-    // Strategy 2: Top-level json_schema (SillyTavern style)
-    context.json_schema = jsonSchema
-    // Strategy 3: Nested in parameters (mirrors spindle.generate.raw behavior)
-    if (!context.parameters) context.parameters = {}
-    context.parameters.response_format = {
-      type: 'json_schema',
-      json_schema: jsonSchema,
-    }
-    
-    spindle.log.info(`[SP] Injected json_schema via context.response_format, context.json_schema, and context.parameters.response_format`)
-  } else {
-    spindle.log.warn(`[SP] Context is not an object — cannot inject json_schema!`)
-    return messages // bail, can't do anything without context mutation
-  }
-
   // Activate runtime state
   state.active = true
   state.lastInjectedAt = Date.now()
@@ -985,12 +960,12 @@ spindle.registerInterceptor(async (messages: LlmMessageDTO[], context: any) => {
   state.activeChatId = chatId
   state.activeGenerationId = ''
 
-  spindle.log.info(`Injecting structured prefill: provider=${provider} model=${modelId} mode=${state.patternMode}`)
+  spindle.log.info(`[SP] Injecting structured prefill: provider=${provider} model=${modelId} mode=${state.patternMode}`)
 
   try {
     const injectedPattern = jsonSchema?.value?.properties?.response?.pattern
     if (typeof injectedPattern === 'string' && injectedPattern.length > 0) {
-      spindle.log.info(`Schema pattern (${injectedPattern.length} chars): ${injectedPattern.slice(0, 200)}${injectedPattern.length > 200 ? '...' : ''}`)
+      spindle.log.info(`[SP] Schema pattern (${injectedPattern.length} chars): ${injectedPattern.slice(0, 200)}${injectedPattern.length > 200 ? '...' : ''}`)
     }
   } catch { /* ignore */ }
 
@@ -1001,7 +976,18 @@ spindle.registerInterceptor(async (messages: LlmMessageDTO[], context: any) => {
     hidePrefill: settings.hide_prefill_in_display,
   })
 
-  return modifiedMessages
+  // Return InterceptorResultDTO — messages + parameters
+  // This injects response_format into the outgoing LLM request
+  // Requires the "generation_parameters" permission
+  return {
+    messages: modifiedMessages,
+    parameters: {
+      response_format: {
+        type: 'json_schema',
+        json_schema: jsonSchema,
+      },
+    },
+  }
 }, 50) // High priority — run early
 
 // ─── Stream Token Handler ────────────────────────────────────────────────────
