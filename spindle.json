@@ -6,7 +6,7 @@
   "github": "https://github.com/mia13165/StructuredPrefill",
   "homepage": "https://rentry.org/structuredprefill",
   "description": "Prefill-like behavior using Structured Outputs (json_schema) instead of assistant-role prefills. Ported from SillyTavern to Lumiverse Spindle.",
-  "permissions": ["interceptor", "generation", "chat_mutation"],
+  "permissions": ["interceptor", "generation", "generation_parameters", "chat_mutation"],
   "entry_backend": "dist/backend.js",
   "entry_frontend": "dist/frontend.js",
   "minimum_lumiverse_version": "0.1.0",
