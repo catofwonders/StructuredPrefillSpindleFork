@@ -216,26 +216,47 @@ function straightenCurlyQuotes(s: string): string {
 
 // ─── Provider Compatibility ──────────────────────────────────────────────────
 
-function supportsStructuredPrefillForSource(source: string): boolean {
-  const src = String(source ?? '').toLowerCase()
-  const incompatible = new Set([
-    'claude', 'anthropic', // Tool-based, not OpenAI response format
-    'ai21', 'deepseek', 'moonshot', 'zai', 'siliconflow', // Map json_schema to JSON mode
-    '',
-  ])
-  return !incompatible.has(src)
-}
+type ProviderMode = 'openai' | 'gemini' | 'anthropic' | 'unsupported'
 
-function getPatternModeForRequest(source: string, modelId: string): 'default' | 'anthropic' {
+// Providers whose `response_format: json_schema` either isn't supported or is
+// silently downgraded to plain JSON mode (no regex enforcement). These fall
+// back to 'unsupported' rather than pretending the prefill is locked.
+const DOWNGRADES_JSON_SCHEMA = new Set([
+  'ai21', 'deepseek', 'moonshot', 'zai', 'siliconflow',
+])
+
+function getProviderMode(source: string, modelId: string): ProviderMode {
   const src = String(source ?? '').toLowerCase()
   const model = String(modelId ?? '').toLowerCase()
 
-  // OpenRouter routes to Anthropic models — use Anthropic-safe regex
-  if (src === 'openrouter' && (model.includes('claude') || model.includes('anthropic'))) {
-    return 'anthropic'
-  }
+  if (!src) return 'unsupported'
+
+  // Anthropic / Claude — tool-call forced output
   if (src === 'claude' || src === 'anthropic') return 'anthropic'
-  return 'default'
+
+  // Google Gemini — responseMimeType + responseSchema
+  if (src === 'google' || src === 'gemini' || src === 'makersuite' || src === 'google-ai-studio') {
+    return 'gemini'
+  }
+
+  // OpenRouter routes by model — detect Claude / Gemini under the hood
+  if (src === 'openrouter') {
+    if (model.includes('claude') || model.includes('anthropic')) return 'anthropic'
+    if (model.includes('gemini') || model.startsWith('google/')) return 'gemini'
+    return 'openai' // OpenRouter OpenAI-compatible for everything else
+  }
+
+  if (DOWNGRADES_JSON_SCHEMA.has(src)) return 'unsupported'
+
+  // Default: assume OpenAI-compatible
+  return 'openai'
+}
+
+// Legacy regex-pattern-mode selector. Anthropic rejects non-ASCII in regex
+// patterns, so we still flag that case for the schema builder. Gemini/other
+// providers use 'default'. Only consulted for the OpenAI regex pattern builder.
+function getPatternModeForRequest(providerMode: ProviderMode): 'default' | 'anthropic' {
+  return providerMode === 'anthropic' ? 'anthropic' : 'default'
 }
 
 // ─── Template Parsing ────────────────────────────────────────────────────────
@@ -417,20 +438,35 @@ function buildJsonSchemaForPrefillValuePattern(
 
   return {
     name: 'response',
-    description: '',
     strict: true,
-    value: {
+    schema: {
       type: 'object',
       properties: {
         response: {
           type: 'string',
-          description: '',
           pattern: pattern,
         },
       },
       required: ['response'],
       additionalProperties: false,
     },
+  }
+}
+
+// Build a plain JSON Schema (no OpenAI wrapper) for Gemini's responseSchema and
+// Anthropic's tool input_schema. Gemini/Anthropic don't honor regex `pattern`
+// constraints, so we only ship the shape enforcement here.
+function buildPlainJsonSchemaForPrefill(): Record<string, any> {
+  return {
+    type: 'object',
+    properties: {
+      response: {
+        type: 'string',
+        description: 'The model response text.',
+      },
+    },
+    required: ['response'],
+    additionalProperties: false,
   }
 }
 
@@ -847,8 +883,9 @@ spindle.registerInterceptor(async (messages: LlmMessageDTO[], context: any) => {
     }
   }
 
-  // Check provider compatibility
-  if (!supportsStructuredPrefillForSource(provider)) {
+  // Resolve provider mode — decides how we inject structured output
+  const providerMode = getProviderMode(provider, modelId)
+  if (providerMode === 'unsupported') {
     spindle.log.info(`[SP] Provider "${provider}" not compatible with structured prefill, skipping`)
     return messages
   }
@@ -857,7 +894,7 @@ spindle.registerInterceptor(async (messages: LlmMessageDTO[], context: any) => {
 
   if (!Array.isArray(messages) || messages.length === 0) return messages
 
-  state.patternMode = getPatternModeForRequest(provider, modelId)
+  state.patternMode = getPatternModeForRequest(providerMode)
 
   // Collect known character names for [[name]] placeholder
   // Lumiverse context doesn't provide user/char names directly,
@@ -960,10 +997,14 @@ spindle.registerInterceptor(async (messages: LlmMessageDTO[], context: any) => {
   state.activeChatId = chatId
   state.activeGenerationId = ''
 
-  spindle.log.info(`[SP] Injecting structured prefill: provider=${provider} model=${modelId} mode=${state.patternMode}`)
+  // Attach a per-chat stream observer to decode the JSON response as it
+  // streams in, apply the final text via chat_mutation, and clean up.
+  attachStreamObserver(chatId)
+
+  spindle.log.info(`[SP] Injecting structured prefill: provider=${provider} model=${modelId} providerMode=${providerMode}`)
 
   try {
-    const injectedPattern = jsonSchema?.value?.properties?.response?.pattern
+    const injectedPattern = jsonSchema?.schema?.properties?.response?.pattern
     if (typeof injectedPattern === 'string' && injectedPattern.length > 0) {
       spindle.log.info(`[SP] Schema pattern (${injectedPattern.length} chars): ${injectedPattern.slice(0, 200)}${injectedPattern.length > 200 ? '...' : ''}`)
     }
@@ -974,132 +1015,183 @@ spindle.registerInterceptor(async (messages: LlmMessageDTO[], context: any) => {
     type: 'sp_activated',
     chatId,
     hidePrefill: settings.hide_prefill_in_display,
+    providerMode,
   })
 
-  // Return InterceptorResultDTO — messages + parameters
-  // This injects response_format into the outgoing LLM request
-  // Requires the "generation_parameters" permission
-  return {
-    messages: modifiedMessages,
-    parameters: {
+  // Build provider-specific parameters.
+  // OpenAI:    response_format: { type: 'json_schema', json_schema: {...} }  ← regex-enforced
+  // Gemini:    responseMimeType + responseSchema                              ← shape-only
+  // Anthropic: tools + tool_choice forced tool call                           ← shape-only
+  //
+  // Gemini and Anthropic don't honor JSON Schema `pattern` constraints, so the
+  // prefill regex lock is OpenAI-only. For those providers the extension still
+  // enforces the JSON shape and unwraps the `response` field at stream time.
+  let parameters: Record<string, unknown>
+
+  if (providerMode === 'anthropic') {
+    const toolSchema = buildPlainJsonSchemaForPrefill()
+    parameters = {
+      tools: [{
+        name: 'prefill_response',
+        description: 'Return the model response text as a structured tool call.',
+        input_schema: toolSchema,
+      }],
+      tool_choice: { type: 'tool', name: 'prefill_response' },
+    }
+  } else if (providerMode === 'gemini') {
+    parameters = {
+      responseMimeType: 'application/json',
+      responseSchema: buildPlainJsonSchemaForPrefill(),
+    }
+  } else {
+    // openai and openai-compatible
+    parameters = {
       response_format: {
         type: 'json_schema',
         json_schema: jsonSchema,
       },
-    },
-  }
-}, 50) // High priority — run early
-
-// ─── Stream Token Handler ────────────────────────────────────────────────────
-
-spindle.on('STREAM_TOKEN_RECEIVED', (payload) => {
-  if (!state.active || !settings.enabled) return
-
-  const { generationId, chatId, token } = payload ?? {}
-  if (chatId && state.activeChatId && chatId !== state.activeChatId) return
-
-  if (generationId) state.activeGenerationId = String(generationId)
-
-  // Accumulate the stream
-  state.accumulatedStreamText += String(token ?? '')
-
-  const rawText = state.accumulatedStreamText
-  const unwrapped = tryUnwrapStructuredOutput(rawText)
-
-  if (typeof unwrapped === 'string') {
-    const displayText = stripHidePrefill(unwrapped)
-    state.lastAppliedText = unwrapped
-
-    // Send decoded text to frontend for display
-    spindle.sendToFrontend({
-      type: 'sp_stream_update',
-      chatId: state.activeChatId,
-      decodedText: displayText,
-      rawIsJson: true,
-    })
-  }
-
-  // Run the stream guard
-  maybeAbortOnStreamLoop(rawText, unwrapped)
-})
-
-// ─── Generation Ended Handler ────────────────────────────────────────────────
-
-spindle.on('GENERATION_ENDED', async (payload) => {
-  if (!state.active) return
-
-  const { chatId, messageId, content } = payload ?? {}
-  if (chatId && state.activeChatId && chatId !== state.activeChatId) return
-
-  // Final unwrap
-  const rawText = String(content ?? state.accumulatedStreamText ?? '')
-  const unwrapped = tryUnwrapStructuredOutput(rawText)
-  const finalText = typeof unwrapped === 'string' ? unwrapped : rawText
-
-  const displayText = stripHidePrefill(finalText)
-  state.lastAppliedText = finalText
-
-  // Apply final decoded text to the chat message via chat_mutation
-  if (messageId && state.activeChatId) {
-    try {
-      const granted = await spindle.permissions.getGranted()
-      if (granted.includes('chat_mutation')) {
-        // Correct API: spindle.chat.updateMessage(chatId, messageId, { content })
-        // Confirmed from LumiScript extension source
-        await (spindle as any).chat.updateMessage(state.activeChatId, messageId, { content: finalText })
-        spindle.log.info(`[SP] Applied decoded text to message ${messageId} in chat ${state.activeChatId}`)
-      } else {
-        spindle.log.info(`[SP] chat_mutation not granted — decoded text sent to frontend only`)
-      }
-    } catch (err) {
-      spindle.log.warn(`[SP] Failed to apply decoded text via spindle.chat.updateMessage: ${err}`)
     }
   }
 
-  // Send final text to frontend
-  spindle.sendToFrontend({
-    type: 'sp_generation_complete',
-    chatId: state.activeChatId,
-    decodedText: displayText,
-    fullText: finalText,
+  // Return InterceptorResultDTO — messages + parameters.
+  // Requires the "generation_parameters" permission; without it parameters are
+  // silently stripped and the extension degrades to a pure message-only pass.
+  return {
+    messages: modifiedMessages,
+    parameters,
+  }
+}, 50) // High priority — run early
+
+// ─── Stream Observation (per-chat) ───────────────────────────────────────────
+//
+// The old approach used three global event listeners (STREAM_TOKEN_RECEIVED,
+// GENERATION_ENDED, GENERATION_STOPPED) with manual chatId filtering. The new
+// Lumiverse API gives us `spindle.generate.observe(chatId)` which:
+//   - automatically filters events to a single chat
+//   - accumulates streamed content into observer.content
+//   - exposes onToken/onEnd/onStop/onStart with typed payloads
+//   - must be .dispose()d when done to free resources
+//
+// One observer per chatId is kept in a registry so we can dispose the previous
+// observer if a new generation starts on the same chat before the last one
+// fully cleans up.
+
+type ActiveObserver = ReturnType<typeof spindle.generate.observe>
+const activeObservers: Map<string, ActiveObserver> = new Map()
+
+function disposeObserverFor(chatId: string): void {
+  const existing = activeObservers.get(chatId)
+  if (existing) {
+    try { existing.dispose() } catch { /* ignore */ }
+    activeObservers.delete(chatId)
+  }
+}
+
+function attachStreamObserver(chatId: string): void {
+  if (!chatId) return
+  disposeObserverFor(chatId)
+
+  const observer = spindle.generate.observe(chatId)
+  activeObservers.set(chatId, observer)
+
+  observer.onStart((info: any) => {
+    if (info?.generationId) state.activeGenerationId = String(info.generationId)
   })
 
-  // Reset state
-  state.active = false
-  clearHidePrefillState()
-  clearContinueState()
-  resetStreamGuard()
-  state.accumulatedStreamText = ''
-})
+  observer.onToken((tokenPayload: any) => {
+    if (!state.active || !settings.enabled) return
+    // Reasoning tokens (chain-of-thought) aren't part of the structured output
+    // body — skip them so they don't poison the JSON accumulator.
+    if ((tokenPayload as any)?.type === 'reasoning') return
 
-// ─── Generation Stopped Handler ──────────────────────────────────────────────
+    state.accumulatedStreamText += String(tokenPayload?.token ?? '')
+    const rawText = state.accumulatedStreamText
+    const unwrapped = tryUnwrapStructuredOutput(rawText)
 
-spindle.on('GENERATION_STOPPED', async (payload) => {
-  if (!state.active) return
+    if (typeof unwrapped === 'string') {
+      const displayText = stripHidePrefill(unwrapped)
+      state.lastAppliedText = unwrapped
 
-  const { chatId, content } = payload ?? {}
-  if (chatId && state.activeChatId && chatId !== state.activeChatId) return
+      spindle.sendToFrontend({
+        type: 'sp_stream_update',
+        chatId: state.activeChatId,
+        decodedText: displayText,
+        rawIsJson: true,
+      })
+    }
 
-  // Best-effort final decode
-  const rawText = String(content ?? state.accumulatedStreamText ?? '')
-  const unwrapped = tryUnwrapStructuredOutput(rawText)
-  const finalText = typeof unwrapped === 'string' ? unwrapped : state.lastAppliedText || rawText
-
-  const displayText = stripHidePrefill(finalText)
-
-  spindle.sendToFrontend({
-    type: 'sp_generation_complete',
-    chatId: state.activeChatId,
-    decodedText: displayText,
-    fullText: finalText,
+    maybeAbortOnStreamLoop(rawText, unwrapped)
   })
 
-  state.active = false
-  clearHidePrefillState()
-  clearContinueState()
-  resetStreamGuard()
-  state.accumulatedStreamText = ''
-})
+  observer.onEnd(async (result: any) => {
+    try {
+      if (!state.active) return
+      if (result?.error) {
+        spindle.log.warn(`[SP] Generation ended with error: ${result.error}`)
+      }
+
+      // Prefer the observer's accumulated content (more reliable than the
+      // event payload's content field for some providers).
+      const rawText = String(result?.content ?? observer.content ?? state.accumulatedStreamText ?? '')
+      const unwrapped = tryUnwrapStructuredOutput(rawText)
+      const finalText = typeof unwrapped === 'string' ? unwrapped : rawText
+      const displayText = stripHidePrefill(finalText)
+      state.lastAppliedText = finalText
+
+      if (result?.messageId && state.activeChatId) {
+        try {
+          const granted = await spindle.permissions.getGranted()
+          if (granted.includes('chat_mutation')) {
+            await (spindle as any).chat.updateMessage(state.activeChatId, result.messageId, { content: finalText })
+            spindle.log.info(`[SP] Applied decoded text to message ${result.messageId} in chat ${state.activeChatId}`)
+          } else {
+            spindle.log.info(`[SP] chat_mutation not granted — decoded text sent to frontend only`)
+          }
+        } catch (err) {
+          spindle.log.warn(`[SP] Failed to apply decoded text: ${err}`)
+        }
+      }
+
+      spindle.sendToFrontend({
+        type: 'sp_generation_complete',
+        chatId: state.activeChatId,
+        decodedText: displayText,
+        fullText: finalText,
+      })
+    } finally {
+      state.active = false
+      clearHidePrefillState()
+      clearContinueState()
+      resetStreamGuard()
+      state.accumulatedStreamText = ''
+      disposeObserverFor(chatId)
+    }
+  })
+
+  observer.onStop((result: any) => {
+    try {
+      if (!state.active) return
+      const rawText = String(result?.content ?? observer.content ?? state.accumulatedStreamText ?? '')
+      const unwrapped = tryUnwrapStructuredOutput(rawText)
+      const finalText = typeof unwrapped === 'string' ? unwrapped : state.lastAppliedText || rawText
+      const displayText = stripHidePrefill(finalText)
+
+      spindle.sendToFrontend({
+        type: 'sp_generation_complete',
+        chatId: state.activeChatId,
+        decodedText: displayText,
+        fullText: finalText,
+      })
+    } finally {
+      state.active = false
+      clearHidePrefillState()
+      clearContinueState()
+      resetStreamGuard()
+      state.accumulatedStreamText = ''
+      disposeObserverFor(chatId)
+    }
+  })
+}
 
 // ─── Frontend Message Handler ────────────────────────────────────────────────
 
