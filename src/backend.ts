@@ -36,6 +36,9 @@ interface RuntimeState {
   knownNames: string[]
   activeChatId: string
   activeGenerationId: string
+  activeConnectionId: string
+  activeInjectionMode: 'json_schema' | 'json_object' | 'gemini' | 'anthropic_tool'
+  retryMessages: LlmMessageDTO[]
   continue: {
     active: boolean
     baseText: string
@@ -90,6 +93,9 @@ const state: RuntimeState = {
   knownNames: [],
   activeChatId: '',
   activeGenerationId: '',
+  activeConnectionId: '',
+  activeInjectionMode: 'json_schema',
+  retryMessages: [],
   continue: {
     active: false,
     baseText: '',
@@ -105,6 +111,51 @@ const state: RuntimeState = {
     suspiciousStreak: 0,
     stopRequested: false,
   },
+}
+
+// ─── JSON-Schema Compatibility Cache ─────────────────────────────────────────
+//
+// Some OpenAI-compatible proxies accept `response_format: json_schema` but
+// silently fail (return empty content with no error). We detect this on first
+// empty response and cache the connection ID so future messages skip straight
+// to json_object mode.
+//
+// Storage: per-user file `json_schema_blocklist.json` — a JSON array of
+// connection IDs known to reject json_schema.
+
+const jsonSchemaBlocklist: Set<string> = new Set()
+let blocklistLoaded = false
+const BLOCKLIST_FILE = 'json_schema_blocklist.json'
+
+async function loadBlocklist(): Promise<void> {
+  if (blocklistLoaded) return
+  try {
+    const stored = await spindle.userStorage.getJson<string[]>(BLOCKLIST_FILE, {
+      fallback: [],
+    })
+    if (Array.isArray(stored)) {
+      jsonSchemaBlocklist.clear()
+      for (const id of stored) if (typeof id === 'string' && id) jsonSchemaBlocklist.add(id)
+    }
+    blocklistLoaded = true
+    if (jsonSchemaBlocklist.size > 0) {
+      spindle.log.info(`[SP] Loaded ${jsonSchemaBlocklist.size} connection(s) from json_schema blocklist`)
+    }
+  } catch (err) {
+    spindle.log.warn(`[SP] Could not load json_schema blocklist: ${err}`)
+    blocklistLoaded = true // avoid looping on repeat failures
+  }
+}
+
+async function addToBlocklist(connectionId: string): Promise<void> {
+  if (!connectionId || jsonSchemaBlocklist.has(connectionId)) return
+  jsonSchemaBlocklist.add(connectionId)
+  try {
+    await spindle.userStorage.setJson(BLOCKLIST_FILE, Array.from(jsonSchemaBlocklist), { indent: 2 })
+    spindle.log.info(`[SP] Added connection ${connectionId} to json_schema blocklist`)
+  } catch (err) {
+    spindle.log.warn(`[SP] Could not persist blocklist: ${err}`)
+  }
 }
 
 // ─── Settings I/O ────────────────────────────────────────────────────────────
@@ -128,6 +179,8 @@ async function loadSettings(): Promise<void> {
   } catch {
     settings = { ...DEFAULT_SETTINGS }
   }
+  // Load the json_schema compatibility cache alongside settings
+  await loadBlocklist()
 }
 
 async function saveSettings(): Promise<void> {
@@ -996,6 +1049,8 @@ spindle.registerInterceptor(async (messages: LlmMessageDTO[], context: any) => {
   state.lastAppliedText = ''
   state.activeChatId = chatId
   state.activeGenerationId = ''
+  state.activeConnectionId = connectionId
+  state.retryMessages = modifiedMessages.map(m => ({ ...m }))
 
   // Attach a per-chat stream observer to decode the JSON response as it
   // streams in, apply the final text via chat_mutation, and clean up.
@@ -1010,25 +1065,20 @@ spindle.registerInterceptor(async (messages: LlmMessageDTO[], context: any) => {
     }
   } catch { /* ignore */ }
 
-  // Notify frontend that structured prefill is active
-  spindle.sendToFrontend({
-    type: 'sp_activated',
-    chatId,
-    hidePrefill: settings.hide_prefill_in_display,
-    providerMode,
-  })
-
   // Build provider-specific parameters.
   // OpenAI:    response_format: { type: 'json_schema', json_schema: {...} }  ← regex-enforced
+  // OpenAI*:   response_format: { type: 'json_object' } + system nudge        ← fallback for proxies
   // Gemini:    responseMimeType + responseSchema                              ← shape-only
   // Anthropic: tools + tool_choice forced tool call                           ← shape-only
   //
-  // Gemini and Anthropic don't honor JSON Schema `pattern` constraints, so the
-  // prefill regex lock is OpenAI-only. For those providers the extension still
-  // enforces the JSON shape and unwraps the `response` field at stream time.
+  // For OpenAI-compatible providers, if we've previously detected that this
+  // connection's proxy rejects json_schema (returned empty content), we skip
+  // straight to json_object mode. Otherwise we try json_schema first and let
+  // the onEnd handler detect failures and auto-retry.
   let parameters: Record<string, unknown>
 
   if (providerMode === 'anthropic') {
+    state.activeInjectionMode = 'anthropic_tool'
     const toolSchema = buildPlainJsonSchemaForPrefill()
     parameters = {
       tools: [{
@@ -1039,24 +1089,50 @@ spindle.registerInterceptor(async (messages: LlmMessageDTO[], context: any) => {
       tool_choice: { type: 'tool', name: 'prefill_response' },
     }
   } else if (providerMode === 'gemini') {
+    state.activeInjectionMode = 'gemini'
     parameters = {
       responseMimeType: 'application/json',
       responseSchema: buildPlainJsonSchemaForPrefill(),
     }
   } else {
     // openai and openai-compatible
-    parameters = {
-      response_format: {
-        type: 'json_schema',
-        json_schema: jsonSchema,
-      },
+    const skipJsonSchema = connectionId && jsonSchemaBlocklist.has(connectionId)
+    if (skipJsonSchema) {
+      spindle.log.info(`[SP] Connection ${connectionId} is in json_schema blocklist — using json_object fallback mode`)
+      state.activeInjectionMode = 'json_object'
+      parameters = {
+        response_format: { type: 'json_object' },
+      }
+      // Nudge the model with a system instruction since json_object doesn't
+      // carry a schema. This is a best-effort shape hint; most models obey.
+      modifiedMessages.unshift({
+        role: 'system',
+        content: 'You MUST respond with a JSON object of the form {"response": "your full reply as a single string"}. No other keys. No prose outside the JSON.',
+      })
+    } else {
+      state.activeInjectionMode = 'json_schema'
+      parameters = {
+        response_format: {
+          type: 'json_schema',
+          json_schema: jsonSchema,
+        },
+      }
     }
   }
+
+  // Notify frontend that structured prefill is active
+  spindle.sendToFrontend({
+    type: 'sp_activated',
+    chatId,
+    hidePrefill: settings.hide_prefill_in_display,
+    providerMode,
+    injectionMode: state.activeInjectionMode,
+  })
 
   // Return InterceptorResultDTO — messages + parameters.
   // Requires the "generation_parameters" permission; without it parameters are
   // silently stripped and the extension degrades to a pure message-only pass.
-  spindle.log.info(`[SP] Returning InterceptorResultDTO with parameter keys: [${Object.keys(parameters).join(', ')}]`)
+  spindle.log.info(`[SP] Returning InterceptorResultDTO with injection mode=${state.activeInjectionMode}, parameter keys=[${Object.keys(parameters).join(', ')}]`)
   return {
     messages: modifiedMessages,
     parameters,
@@ -1139,7 +1215,7 @@ function attachStreamObserver(chatId: string): void {
 
       // Prefer the observer's accumulated content (more reliable than the
       // event payload's content field for some providers).
-      const rawText = String(result?.content ?? observer.content ?? state.accumulatedStreamText ?? '')
+      let rawText = String(result?.content ?? observer.content ?? state.accumulatedStreamText ?? '')
 
       // ─── Diagnostic: what did the provider actually return? ───
       const preview = rawText.length > 300 ? rawText.slice(0, 300) + '...' : rawText
@@ -1147,6 +1223,51 @@ function attachStreamObserver(chatId: string): void {
       spindle.log.info(`[SP] Tokens accumulated during stream: ${state.accumulatedStreamText.length} chars`)
       spindle.log.info(`[SP] Observer.content length: ${String(observer.content ?? '').length} chars`)
       spindle.log.info(`[SP] result.content length: ${String(result?.content ?? '').length} chars`)
+
+      // ─── Auto-fallback: if json_schema returned empty, retry with json_object ───
+      // Heuristic: mode was json_schema, content is empty, connection is known.
+      // This catches proxies that silently reject json_schema.
+      const shouldRetry =
+        state.activeInjectionMode === 'json_schema' &&
+        rawText.length === 0 &&
+        state.accumulatedStreamText.length === 0 &&
+        !!state.activeConnectionId &&
+        !jsonSchemaBlocklist.has(state.activeConnectionId)
+
+      if (shouldRetry) {
+        spindle.log.warn(`[SP] json_schema returned empty content on connection ${state.activeConnectionId} — falling back to json_object mode and retrying`)
+        await addToBlocklist(state.activeConnectionId)
+
+        try {
+          spindle.toast.warning(
+            `This connection doesn't support json_schema — falling back to json_object mode. Future messages on this connection will use the fallback automatically.`,
+            { title: EXT_NAME, duration: 9000 }
+          )
+        } catch { /* toast best-effort */ }
+
+        // Retry via spindle.generate.raw() with json_object + system nudge.
+        // We prepend a system instruction to make the model wrap its reply in
+        // {"response": "..."} — no schema enforcement, best-effort shape.
+        const retryMessages = state.retryMessages.slice()
+        retryMessages.unshift({
+          role: 'system',
+          content: 'You MUST respond with a JSON object of the form {"response": "your full reply as a single string"}. No other keys. No prose outside the JSON.',
+        })
+
+        try {
+          const retryResult = await spindle.generate.raw({
+            messages: retryMessages as any,
+            parameters: {
+              response_format: { type: 'json_object' },
+            },
+            connection_id: state.activeConnectionId,
+          })
+          rawText = String((retryResult as any)?.content ?? '')
+          spindle.log.info(`[SP] Retry (json_object) returned ${rawText.length} chars`)
+        } catch (err) {
+          spindle.log.warn(`[SP] Retry (json_object) failed: ${err}`)
+        }
+      }
 
       const unwrapped = tryUnwrapStructuredOutput(rawText)
       if (typeof unwrapped === 'string') {
@@ -1187,6 +1308,7 @@ function attachStreamObserver(chatId: string): void {
       clearContinueState()
       resetStreamGuard()
       state.accumulatedStreamText = ''
+      state.retryMessages = []
       disposeObserverFor(chatId)
     }
   })
@@ -1211,6 +1333,7 @@ function attachStreamObserver(chatId: string): void {
       clearContinueState()
       resetStreamGuard()
       state.accumulatedStreamText = ''
+      state.retryMessages = []
       disposeObserverFor(chatId)
     }
   })
@@ -1261,7 +1384,35 @@ spindle.onFrontendMessage(async (payload: any, userId) => {
         type: 'state',
         active: state.active,
         patternMode: state.patternMode,
+        blocklist: Array.from(jsonSchemaBlocklist),
       })
+      break
+    }
+
+    case 'clear_blocklist': {
+      jsonSchemaBlocklist.clear()
+      try {
+        await spindle.userStorage.setJson(BLOCKLIST_FILE, [], { indent: 2 })
+        spindle.log.info(`[SP] Cleared json_schema blocklist`)
+      } catch (err) {
+        spindle.log.warn(`[SP] Could not clear blocklist: ${err}`)
+      }
+      spindle.sendToFrontend({ type: 'blocklist_cleared' })
+      break
+    }
+
+    case 'remove_from_blocklist': {
+      const connId = String(payload?.connectionId ?? '')
+      if (connId && jsonSchemaBlocklist.has(connId)) {
+        jsonSchemaBlocklist.delete(connId)
+        try {
+          await spindle.userStorage.setJson(BLOCKLIST_FILE, Array.from(jsonSchemaBlocklist), { indent: 2 })
+          spindle.log.info(`[SP] Removed connection ${connId} from blocklist`)
+        } catch (err) {
+          spindle.log.warn(`[SP] Could not persist blocklist: ${err}`)
+        }
+      }
+      spindle.sendToFrontend({ type: 'blocklist', blocklist: Array.from(jsonSchemaBlocklist) })
       break
     }
   }
