@@ -135,6 +135,21 @@ function buildSettingsHtml(): string {
       </div>
 
       <div class="sp-section">
+        <div class="sp-section-header" data-section="compat">Connection Compatibility</div>
+        <div class="sp-section-body sp-collapsed" data-section-body="compat">
+          <small style="color:var(--lumiverse-text-muted);display:block;margin-bottom:8px;">
+            The extension auto-detects what structured-output mode each connection supports.
+            If a connection was wrongly marked (e.g. the proxy was temporarily down), reset this
+            to let the extension re-probe from scratch.
+          </small>
+          <button type="button" data-action="reset_compat" class="sp-button">
+            Reset Connection Compatibility
+          </button>
+          <div data-compat-status style="margin-top:8px;font-size:12px;color:var(--lumiverse-text-muted);"></div>
+        </div>
+      </div>
+
+      <div class="sp-section">
         <div class="sp-section-header" data-section="help">Help</div>
         <div class="sp-section-body sp-collapsed" data-section-body="help">
           <small style="color:var(--lumiverse-text-muted)">
@@ -207,6 +222,18 @@ function wireSettingsListeners(root: HTMLElement): void {
       if (!key || !currentSettings) return
       ;(currentSettings as any)[key] = select.value
       ctx.sendToBackend({ type: 'update_settings', settings: { [key]: select.value } })
+    })
+  })
+
+  // Action buttons
+  root.querySelectorAll<HTMLButtonElement>('button[data-action]').forEach(button => {
+    button.addEventListener('click', () => {
+      const action = button.getAttribute('data-action')
+      if (action === 'reset_compat') {
+        ctx.sendToBackend({ type: 'clear_blocklist' })
+        const status = root.querySelector<HTMLElement>('[data-compat-status]')
+        if (status) status.textContent = 'Resetting…'
+      }
     })
   })
 }
@@ -329,6 +356,26 @@ function injectStyles(): () => void {
       resize: vertical;
       min-height: 60px;
     }
+
+    .sp-button {
+      background: var(--lumiverse-surface-2, #2a2a2a);
+      color: var(--lumiverse-text, #fff);
+      border: 1px solid var(--lumiverse-border, #444);
+      padding: 6px 12px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 12px;
+      font-family: inherit;
+    }
+
+    .sp-button:hover {
+      background: var(--lumiverse-surface-3, #3a3a3a);
+      border-color: var(--lumiverse-accent, #888);
+    }
+
+    .sp-button:active {
+      transform: translateY(1px);
+    }
   `)
 }
 
@@ -382,6 +429,17 @@ export function setup(context: SpindleFrontendContext) {
 
       case 'sp_generation_complete': {
         // Generation finished — final decoded text available
+        break
+      }
+
+      case 'blocklist_cleared': {
+        if (drawerTab) {
+          const status = drawerTab.root.querySelector('[data-compat-status]')
+          if (status) {
+            status.textContent = 'Compatibility cache cleared. Next message will re-probe.'
+            setTimeout(() => { if (status) status.textContent = '' }, 5000)
+          }
+        }
         break
       }
     }

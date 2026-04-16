@@ -37,7 +37,7 @@ interface RuntimeState {
   activeChatId: string
   activeGenerationId: string
   activeConnectionId: string
-  activeInjectionMode: 'json_schema' | 'json_object' | 'gemini' | 'anthropic_tool'
+  activeInjectionMode: 'json_schema' | 'json_object' | 'prompt_only' | 'gemini' | 'anthropic_tool'
   retryMessages: LlmMessageDTO[]
   continue: {
     active: boolean
@@ -113,49 +113,88 @@ const state: RuntimeState = {
   },
 }
 
-// ─── JSON-Schema Compatibility Cache ─────────────────────────────────────────
+// ─── Provider Compatibility Cache (three-tier ladder) ───────────────────────
 //
-// Some OpenAI-compatible proxies accept `response_format: json_schema` but
-// silently fail (return empty content with no error). We detect this on first
-// empty response and cache the connection ID so future messages skip straight
-// to json_object mode.
+// Some OpenAI-compatible proxies reject `response_format: json_schema` (and
+// sometimes even `response_format: json_object`) silently — they return empty
+// content with no error. We maintain a three-tier ladder:
 //
-// Storage: per-user file `json_schema_blocklist.json` — a JSON array of
-// connection IDs known to reject json_schema.
+//   tier 1: json_schema    — full regex-locked structured output (real OpenAI)
+//   tier 2: json_object    — JSON-shape-only, works on many proxies
+//   tier 3: prompt_only    — no response_format at all, just a system nudge
+//                            telling the model to wrap its reply in JSON
+//
+// We probe tier 1 first on unknown connections. If a tier returns empty, we
+// auto-retry via spindle.generate.raw() with the next tier, cache the working
+// tier, and apply its output. Future messages on that connection skip straight
+// to the cached tier.
+//
+// Storage: per-user file `json_schema_blocklist.json` — kept as the historical
+// filename so old installs migrate cleanly. Stored as a JSON object mapping
+// connectionId -> tier.
 
-const jsonSchemaBlocklist: Set<string> = new Set()
-let blocklistLoaded = false
+type CompatTier = 'json_schema' | 'json_object' | 'prompt_only'
+const TIER_ORDER: CompatTier[] = ['json_schema', 'json_object', 'prompt_only']
+
+function nextTier(current: CompatTier): CompatTier | null {
+  const idx = TIER_ORDER.indexOf(current)
+  if (idx < 0 || idx >= TIER_ORDER.length - 1) return null
+  return TIER_ORDER[idx + 1]
+}
+
+const compatCache: Map<string, CompatTier> = new Map()
+let compatCacheLoaded = false
 const BLOCKLIST_FILE = 'json_schema_blocklist.json'
 
-async function loadBlocklist(): Promise<void> {
-  if (blocklistLoaded) return
+async function loadCompatCache(): Promise<void> {
+  if (compatCacheLoaded) return
   try {
-    const stored = await spindle.userStorage.getJson<string[]>(BLOCKLIST_FILE, {
-      fallback: [],
-    })
+    // Migration-tolerant load: accept either old-format string[] (legacy) or
+    // new-format { connectionId: tier }. Old-format entries become 'json_object'.
+    const stored = await spindle.userStorage.getJson<unknown>(BLOCKLIST_FILE, { fallback: {} })
+    compatCache.clear()
     if (Array.isArray(stored)) {
-      jsonSchemaBlocklist.clear()
-      for (const id of stored) if (typeof id === 'string' && id) jsonSchemaBlocklist.add(id)
+      for (const id of stored) {
+        if (typeof id === 'string' && id) compatCache.set(id, 'json_object')
+      }
+    } else if (stored && typeof stored === 'object') {
+      for (const [id, tier] of Object.entries(stored as Record<string, unknown>)) {
+        if (typeof id === 'string' && id && (tier === 'json_schema' || tier === 'json_object' || tier === 'prompt_only')) {
+          compatCache.set(id, tier as CompatTier)
+        }
+      }
     }
-    blocklistLoaded = true
-    if (jsonSchemaBlocklist.size > 0) {
-      spindle.log.info(`[SP] Loaded ${jsonSchemaBlocklist.size} connection(s) from json_schema blocklist`)
+    compatCacheLoaded = true
+    if (compatCache.size > 0) {
+      spindle.log.info(`[SP] Loaded ${compatCache.size} connection compatibility entries`)
     }
   } catch (err) {
-    spindle.log.warn(`[SP] Could not load json_schema blocklist: ${err}`)
-    blocklistLoaded = true // avoid looping on repeat failures
+    spindle.log.warn(`[SP] Could not load compat cache: ${err}`)
+    compatCacheLoaded = true
   }
 }
 
-async function addToBlocklist(connectionId: string): Promise<void> {
-  if (!connectionId || jsonSchemaBlocklist.has(connectionId)) return
-  jsonSchemaBlocklist.add(connectionId)
+async function persistCompatCache(): Promise<void> {
   try {
-    await spindle.userStorage.setJson(BLOCKLIST_FILE, Array.from(jsonSchemaBlocklist), { indent: 2 })
-    spindle.log.info(`[SP] Added connection ${connectionId} to json_schema blocklist`)
+    const obj: Record<string, CompatTier> = {}
+    for (const [k, v] of compatCache.entries()) obj[k] = v
+    await spindle.userStorage.setJson(BLOCKLIST_FILE, obj, { indent: 2 })
   } catch (err) {
-    spindle.log.warn(`[SP] Could not persist blocklist: ${err}`)
+    spindle.log.warn(`[SP] Could not persist compat cache: ${err}`)
   }
+}
+
+async function setCompatTier(connectionId: string, tier: CompatTier): Promise<void> {
+  if (!connectionId) return
+  if (compatCache.get(connectionId) === tier) return
+  compatCache.set(connectionId, tier)
+  spindle.log.info(`[SP] Set compat tier for ${connectionId}: ${tier}`)
+  await persistCompatCache()
+}
+
+function getCompatTier(connectionId: string): CompatTier {
+  if (!connectionId) return 'json_schema'
+  return compatCache.get(connectionId) ?? 'json_schema'
 }
 
 // ─── Settings I/O ────────────────────────────────────────────────────────────
@@ -179,8 +218,8 @@ async function loadSettings(): Promise<void> {
   } catch {
     settings = { ...DEFAULT_SETTINGS }
   }
-  // Load the json_schema compatibility cache alongside settings
-  await loadBlocklist()
+  // Load the compatibility cache alongside settings
+  await loadCompatCache()
 }
 
 async function saveSettings(): Promise<void> {
@@ -1095,28 +1134,39 @@ spindle.registerInterceptor(async (messages: LlmMessageDTO[], context: any) => {
       responseSchema: buildPlainJsonSchemaForPrefill(),
     }
   } else {
-    // openai and openai-compatible
-    const skipJsonSchema = connectionId && jsonSchemaBlocklist.has(connectionId)
-    if (skipJsonSchema) {
-      spindle.log.info(`[SP] Connection ${connectionId} is in json_schema blocklist — using json_object fallback mode`)
-      state.activeInjectionMode = 'json_object'
-      parameters = {
-        response_format: { type: 'json_object' },
-      }
-      // Nudge the model with a system instruction since json_object doesn't
-      // carry a schema. This is a best-effort shape hint; most models obey.
-      modifiedMessages.unshift({
-        role: 'system',
-        content: 'You MUST respond with a JSON object of the form {"response": "your full reply as a single string"}. No other keys. No prose outside the JSON.',
-      })
-    } else {
-      state.activeInjectionMode = 'json_schema'
+    // openai and openai-compatible — pick a tier from the compat cache.
+    // Tier 1: json_schema (regex-locked)
+    // Tier 2: json_object (shape only)
+    // Tier 3: prompt_only (no response_format; system nudge only)
+    const tier = getCompatTier(connectionId)
+    state.activeInjectionMode = tier
+
+    if (tier === 'json_schema') {
       parameters = {
         response_format: {
           type: 'json_schema',
           json_schema: jsonSchema,
         },
       }
+    } else if (tier === 'json_object') {
+      spindle.log.info(`[SP] Using cached tier json_object for ${connectionId}`)
+      parameters = {
+        response_format: { type: 'json_object' },
+      }
+      // Nudge the model since json_object has no schema
+      modifiedMessages.unshift({
+        role: 'system',
+        content: 'You MUST respond with a JSON object of the form {"response": "your full reply as a single string"}. No other keys. No prose outside the JSON.',
+      })
+    } else {
+      // prompt_only — no response_format at all, just a strong system nudge.
+      // This works on proxies that reject response_format entirely.
+      spindle.log.info(`[SP] Using cached tier prompt_only for ${connectionId}`)
+      parameters = {}
+      modifiedMessages.unshift({
+        role: 'system',
+        content: 'CRITICAL: Your entire response must be a single JSON object of the form {"response":"your full reply as a single string, with all newlines escaped as \\n"}. Do not include any text before or after the JSON. Do not use markdown code fences. Start your reply with the literal character { and end with }.',
+      })
     }
   }
 
@@ -1224,48 +1274,85 @@ function attachStreamObserver(chatId: string): void {
       spindle.log.info(`[SP] Observer.content length: ${String(observer.content ?? '').length} chars`)
       spindle.log.info(`[SP] result.content length: ${String(result?.content ?? '').length} chars`)
 
-      // ─── Auto-fallback: if json_schema returned empty, retry with json_object ───
-      // Heuristic: mode was json_schema, content is empty, connection is known.
-      // This catches proxies that silently reject json_schema.
+      // ─── Auto-fallback: climb the compatibility tier ladder ───
+      // If the current tier returned empty content (and we aren't on tier 3
+      // already), retry via spindle.generate.raw() with the next tier until
+      // one returns content or we run out of tiers. Cache the working tier
+      // so future messages skip straight to it.
+      const isOpenAITier =
+        state.activeInjectionMode === 'json_schema' ||
+        state.activeInjectionMode === 'json_object' ||
+        state.activeInjectionMode === 'prompt_only'
+
+      let tierAtStart: CompatTier | null = null
+      if (isOpenAITier) tierAtStart = state.activeInjectionMode as CompatTier
+
       const shouldRetry =
-        state.activeInjectionMode === 'json_schema' &&
+        !!tierAtStart &&
         rawText.length === 0 &&
         state.accumulatedStreamText.length === 0 &&
-        !!state.activeConnectionId &&
-        !jsonSchemaBlocklist.has(state.activeConnectionId)
+        !!state.activeConnectionId
 
-      if (shouldRetry) {
-        spindle.log.warn(`[SP] json_schema returned empty content on connection ${state.activeConnectionId} — falling back to json_object mode and retrying`)
-        await addToBlocklist(state.activeConnectionId)
+      if (shouldRetry && tierAtStart) {
+        let currentTier: CompatTier | null = tierAtStart
+        let toastShown = false
 
-        try {
-          spindle.toast.warning(
-            `This connection doesn't support json_schema — falling back to json_object mode. Future messages on this connection will use the fallback automatically.`,
-            { title: EXT_NAME, duration: 9000 }
-          )
-        } catch { /* toast best-effort */ }
+        while (rawText.length === 0 && currentTier) {
+          const nt = nextTier(currentTier)
+          if (!nt) break
+          currentTier = nt
 
-        // Retry via spindle.generate.raw() with json_object + system nudge.
-        // We prepend a system instruction to make the model wrap its reply in
-        // {"response": "..."} — no schema enforcement, best-effort shape.
-        const retryMessages = state.retryMessages.slice()
-        retryMessages.unshift({
-          role: 'system',
-          content: 'You MUST respond with a JSON object of the form {"response": "your full reply as a single string"}. No other keys. No prose outside the JSON.',
-        })
+          spindle.log.warn(`[SP] Empty content on connection ${state.activeConnectionId} — trying fallback tier: ${currentTier}`)
 
-        try {
-          const retryResult = await spindle.generate.raw({
-            messages: retryMessages as any,
-            parameters: {
-              response_format: { type: 'json_object' },
-            },
-            connection_id: state.activeConnectionId,
-          })
-          rawText = String((retryResult as any)?.content ?? '')
-          spindle.log.info(`[SP] Retry (json_object) returned ${rawText.length} chars`)
-        } catch (err) {
-          spindle.log.warn(`[SP] Retry (json_object) failed: ${err}`)
+          if (!toastShown) {
+            try {
+              spindle.toast.warning(
+                `This connection doesn't support ${tierAtStart} — falling back to ${currentTier} mode. Future messages on this connection will use the working mode automatically.`,
+                { title: EXT_NAME, duration: 9000 }
+              )
+            } catch { /* toast best-effort */ }
+            toastShown = true
+          }
+
+          // Build parameters + messages for this tier
+          const retryMessages = state.retryMessages.slice()
+          let retryParams: Record<string, unknown> = {}
+
+          if (currentTier === 'json_object') {
+            retryParams = { response_format: { type: 'json_object' } }
+            retryMessages.unshift({
+              role: 'system',
+              content: 'You MUST respond with a JSON object of the form {"response": "your full reply as a single string"}. No other keys. No prose outside the JSON.',
+            })
+          } else if (currentTier === 'prompt_only') {
+            retryParams = {}
+            retryMessages.unshift({
+              role: 'system',
+              content: 'CRITICAL: Your entire response must be a single JSON object of the form {"response":"your full reply as a single string, with all newlines escaped as \\n"}. Do not include any text before or after the JSON. Do not use markdown code fences. Start your reply with the literal character { and end with }.',
+            })
+          }
+
+          try {
+            const retryResult = await spindle.generate.raw({
+              messages: retryMessages as any,
+              parameters: retryParams,
+              connection_id: state.activeConnectionId,
+            })
+            rawText = String((retryResult as any)?.content ?? '')
+            spindle.log.info(`[SP] Retry (${currentTier}) returned ${rawText.length} chars`)
+            if (rawText.length > 0) {
+              await setCompatTier(state.activeConnectionId, currentTier)
+              break
+            }
+          } catch (err) {
+            spindle.log.warn(`[SP] Retry (${currentTier}) failed: ${err}`)
+          }
+        }
+
+        if (rawText.length === 0) {
+          spindle.log.warn(`[SP] All compatibility tiers exhausted — connection may be broken`)
+          // Record the deepest tier we tried so we don't repeat tier 1 every time
+          if (currentTier) await setCompatTier(state.activeConnectionId, currentTier)
         }
       }
 
@@ -1380,22 +1467,24 @@ spindle.onFrontendMessage(async (payload: any, userId) => {
     }
 
     case 'get_state': {
+      const compatEntries: Record<string, CompatTier> = {}
+      for (const [k, v] of compatCache.entries()) compatEntries[k] = v
       spindle.sendToFrontend({
         type: 'state',
         active: state.active,
         patternMode: state.patternMode,
-        blocklist: Array.from(jsonSchemaBlocklist),
+        compatCache: compatEntries,
       })
       break
     }
 
     case 'clear_blocklist': {
-      jsonSchemaBlocklist.clear()
+      compatCache.clear()
       try {
-        await spindle.userStorage.setJson(BLOCKLIST_FILE, [], { indent: 2 })
-        spindle.log.info(`[SP] Cleared json_schema blocklist`)
+        await spindle.userStorage.setJson(BLOCKLIST_FILE, {}, { indent: 2 })
+        spindle.log.info(`[SP] Cleared connection compatibility cache`)
       } catch (err) {
-        spindle.log.warn(`[SP] Could not clear blocklist: ${err}`)
+        spindle.log.warn(`[SP] Could not clear cache: ${err}`)
       }
       spindle.sendToFrontend({ type: 'blocklist_cleared' })
       break
@@ -1403,16 +1492,14 @@ spindle.onFrontendMessage(async (payload: any, userId) => {
 
     case 'remove_from_blocklist': {
       const connId = String(payload?.connectionId ?? '')
-      if (connId && jsonSchemaBlocklist.has(connId)) {
-        jsonSchemaBlocklist.delete(connId)
-        try {
-          await spindle.userStorage.setJson(BLOCKLIST_FILE, Array.from(jsonSchemaBlocklist), { indent: 2 })
-          spindle.log.info(`[SP] Removed connection ${connId} from blocklist`)
-        } catch (err) {
-          spindle.log.warn(`[SP] Could not persist blocklist: ${err}`)
-        }
+      if (connId && compatCache.has(connId)) {
+        compatCache.delete(connId)
+        await persistCompatCache()
+        spindle.log.info(`[SP] Removed connection ${connId} from compat cache`)
       }
-      spindle.sendToFrontend({ type: 'blocklist', blocklist: Array.from(jsonSchemaBlocklist) })
+      const compatEntries: Record<string, CompatTier> = {}
+      for (const [k, v] of compatCache.entries()) compatEntries[k] = v
+      spindle.sendToFrontend({ type: 'blocklist', compatCache: compatEntries })
       break
     }
   }
