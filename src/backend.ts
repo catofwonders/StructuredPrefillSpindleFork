@@ -1056,6 +1056,7 @@ spindle.registerInterceptor(async (messages: LlmMessageDTO[], context: any) => {
   // Return InterceptorResultDTO — messages + parameters.
   // Requires the "generation_parameters" permission; without it parameters are
   // silently stripped and the extension degrades to a pure message-only pass.
+  spindle.log.info(`[SP] Returning InterceptorResultDTO with parameter keys: [${Object.keys(parameters).join(', ')}]`)
   return {
     messages: modifiedMessages,
     parameters,
@@ -1104,6 +1105,12 @@ function attachStreamObserver(chatId: string): void {
     // body — skip them so they don't poison the JSON accumulator.
     if ((tokenPayload as any)?.type === 'reasoning') return
 
+    // Diagnostic: confirm at least one content token arrived
+    if (state.accumulatedStreamText.length === 0) {
+      const first = String(tokenPayload?.token ?? '').slice(0, 80)
+      spindle.log.info(`[SP] First stream token received: ${JSON.stringify(first)}`)
+    }
+
     state.accumulatedStreamText += String(tokenPayload?.token ?? '')
     const rawText = state.accumulatedStreamText
     const unwrapped = tryUnwrapStructuredOutput(rawText)
@@ -1133,10 +1140,26 @@ function attachStreamObserver(chatId: string): void {
       // Prefer the observer's accumulated content (more reliable than the
       // event payload's content field for some providers).
       const rawText = String(result?.content ?? observer.content ?? state.accumulatedStreamText ?? '')
+
+      // ─── Diagnostic: what did the provider actually return? ───
+      const preview = rawText.length > 300 ? rawText.slice(0, 300) + '...' : rawText
+      spindle.log.info(`[SP] Raw response (${rawText.length} chars): ${JSON.stringify(preview)}`)
+      spindle.log.info(`[SP] Tokens accumulated during stream: ${state.accumulatedStreamText.length} chars`)
+      spindle.log.info(`[SP] Observer.content length: ${String(observer.content ?? '').length} chars`)
+      spindle.log.info(`[SP] result.content length: ${String(result?.content ?? '').length} chars`)
+
       const unwrapped = tryUnwrapStructuredOutput(rawText)
+      if (typeof unwrapped === 'string') {
+        spindle.log.info(`[SP] JSON unwrap succeeded: extracted ${unwrapped.length} chars from response field`)
+      } else {
+        spindle.log.warn(`[SP] JSON unwrap FAILED — raw content does not parse as {"response": "..."} — falling back to raw text`)
+      }
+
       const finalText = typeof unwrapped === 'string' ? unwrapped : rawText
       const displayText = stripHidePrefill(finalText)
       state.lastAppliedText = finalText
+
+      spindle.log.info(`[SP] Final decoded text: ${finalText.length} chars, display: ${displayText.length} chars`)
 
       if (result?.messageId && state.activeChatId) {
         try {
