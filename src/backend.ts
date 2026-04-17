@@ -1363,13 +1363,40 @@ function attachStreamObserver(chatId: string): void {
 
           try {
             spindle.log.info(`[SP] Retry (${currentTier}) sending with currentUserId=${String(currentUserId ?? '(empty)')}`)
-            const retryResult = await (spindle.generate.raw as any)({
+
+            // Resolve the connection's model and provider so we can pass them
+            // explicitly — `generate.raw` doesn't auto-resolve from connection_id
+            // the way the main generation pipeline does.
+            let retryProvider = ''
+            let retryModel = ''
+            try {
+              const conn = await spindle.connections.get(state.activeConnectionId, currentUserId)
+              if (conn) {
+                retryProvider = String(conn.provider ?? '')
+                retryModel = String(conn.model ?? '')
+                spindle.log.info(`[SP] Retry resolved model=${retryModel} provider=${retryProvider}`)
+              }
+            } catch (err) {
+              spindle.log.warn(`[SP] Retry could not resolve connection: ${err}`)
+            }
+
+            const retryRequest: Record<string, unknown> = {
               messages: retryMessages as any,
               parameters: retryParams,
               connection_id: state.activeConnectionId,
               userId: currentUserId,
               user_id: currentUserId,
-            })
+            }
+            // Cover both common field names — runtime ignores the unused one
+            if (retryModel) {
+              retryRequest.model = retryModel
+              ;(retryRequest.parameters as any).model = retryModel
+            }
+            if (retryProvider) {
+              retryRequest.provider = retryProvider
+            }
+
+            const retryResult = await (spindle.generate.raw as any)(retryRequest)
             const retryText = String((retryResult as any)?.content ?? '')
             const retryLooksRight = looksLikeOurJson(retryText)
             spindle.log.info(`[SP] Retry (${currentTier}) returned ${retryText.length} chars, parses as JSON: ${retryLooksRight}`)
