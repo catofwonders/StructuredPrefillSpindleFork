@@ -1404,8 +1404,30 @@ function attachStreamObserver(chatId: string): void {
         try {
           const granted = await spindle.permissions.getGranted()
           if (granted.includes('chat_mutation')) {
-            await (spindle as any).chat.updateMessage(state.activeChatId, result.messageId, { content: finalText })
-            spindle.log.info(`[SP] Applied decoded text to message ${result.messageId} in chat ${state.activeChatId}`)
+            // First update the stored content (cheap — in case delete/append fails we still
+            // have the decoded text on disk).
+            try {
+              await (spindle as any).chat.updateMessage(state.activeChatId, result.messageId, { content: finalText })
+              spindle.log.info(`[SP] Stored decoded text on message ${result.messageId}`)
+            } catch (err) {
+              spindle.log.warn(`[SP] updateMessage failed (continuing to delete/replace): ${err}`)
+            }
+
+            // Now delete + re-append so Lumiverse re-renders from scratch instead of
+            // showing the cached raw JSON stream. This fixes the "JSON wrapper still
+            // visible in chat" issue on prompt_only tier where Lumiverse doesn't know
+            // the stream was JSON-wrapped.
+            try {
+              await (spindle as any).chat.deleteMessage(state.activeChatId, result.messageId)
+              const appended = await (spindle as any).chat.appendMessage(state.activeChatId, {
+                role: 'assistant',
+                content: finalText,
+                metadata: { source: 'structured_prefill_rerender', originalMessageId: result.messageId },
+              })
+              spindle.log.info(`[SP] Replaced message ${result.messageId} with fresh render (new id: ${appended?.id ?? '?'})`)
+            } catch (err) {
+              spindle.log.warn(`[SP] Delete+append failed — message kept with raw content: ${err}`)
+            }
           } else {
             spindle.log.info(`[SP] chat_mutation not granted — decoded text sent to frontend only`)
           }
