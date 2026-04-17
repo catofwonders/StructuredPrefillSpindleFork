@@ -959,6 +959,13 @@ spindle.registerInterceptor(async (messages: LlmMessageDTO[], context: any) => {
   // Diagnostic: log context on every interceptor call
   spindle.log.info(`[SP] Interceptor fired: type=${generationType} connectionId=${connectionId} chatId=${chatId || '(empty)'}`)
 
+  // Clear any stale state from a previous generation (if prior onEnd didn't
+  // fire fully or was cut short). This happens BEFORE we set up new state.
+  if (state.active) {
+    spindle.log.info(`[SP] Clearing stale state from previous generation before starting new one`)
+    resetActiveGenerationState('new generation starting')
+  }
+
   // Skip impersonate and quiet generations
   if (generationType === 'impersonate' || generationType === 'quiet') return messages
 
@@ -1240,12 +1247,10 @@ function resetActiveGenerationState(reason: string): void {
 
 function attachStreamObserver(chatId: string): void {
   if (!chatId) return
-  // If we had a prior observer and state for this chat, fully reset before
-  // attaching the new one — prevents a disposed-mid-stream observer's state
-  // from poisoning the new generation's delete/replace or blocking the
-  // interceptor from firing fresh.
+  // Kill any previously-attached observer for this chat. The interceptor
+  // just set state.active=true and populated new state for this generation,
+  // so we DO NOT reset state here — we'd wipe out the freshly-set flags.
   disposeObserverFor(chatId, 'attaching new observer')
-  resetActiveGenerationState('new generation starting')
 
   const observer = spindle.generate.observe(chatId)
   activeObservers.set(chatId, observer)
