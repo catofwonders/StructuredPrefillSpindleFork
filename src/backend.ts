@@ -918,7 +918,7 @@ async function runPrefillGenerator(messages: LlmMessageDTO[], tailIndex: number)
     .filter(Boolean)
 
   try {
-    const result = await spindle.generate.raw({
+    const result = await (spindle.generate.raw as any)({
       messages: baseMessages,
       parameters: {
         max_tokens: clampInt(settings.prefill_gen_max_tokens, 1, 20000, 15),
@@ -928,7 +928,7 @@ async function runPrefillGenerator(messages: LlmMessageDTO[], tailIndex: number)
         ...(stopStrings.length > 0 ? { stop: stopStrings } : {}),
       },
       connection_id: settings.prefill_gen_connection_id,
-    })
+    }, currentUserId)
 
     return String(result?.content ?? '')
   } catch (err: any) {
@@ -1360,11 +1360,11 @@ function attachStreamObserver(chatId: string): void {
           }
 
           try {
-            const retryResult = await spindle.generate.raw({
+            const retryResult = await (spindle.generate.raw as any)({
               messages: retryMessages as any,
               parameters: retryParams,
               connection_id: state.activeConnectionId,
-            })
+            }, currentUserId)
             const retryText = String((retryResult as any)?.content ?? '')
             const retryLooksRight = looksLikeOurJson(retryText)
             spindle.log.info(`[SP] Retry (${currentTier}) returned ${retryText.length} chars, parses as JSON: ${retryLooksRight}`)
