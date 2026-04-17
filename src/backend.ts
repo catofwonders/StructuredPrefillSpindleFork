@@ -928,7 +928,9 @@ async function runPrefillGenerator(messages: LlmMessageDTO[], tailIndex: number)
         ...(stopStrings.length > 0 ? { stop: stopStrings } : {}),
       },
       connection_id: settings.prefill_gen_connection_id,
-    }, currentUserId)
+      userId: currentUserId,
+      user_id: currentUserId,
+    })
 
     return String(result?.content ?? '')
   } catch (err: any) {
@@ -1365,7 +1367,9 @@ function attachStreamObserver(chatId: string): void {
               messages: retryMessages as any,
               parameters: retryParams,
               connection_id: state.activeConnectionId,
-            }, currentUserId)
+              userId: currentUserId,
+              user_id: currentUserId,
+            })
             const retryText = String((retryResult as any)?.content ?? '')
             const retryLooksRight = looksLikeOurJson(retryText)
             spindle.log.info(`[SP] Retry (${currentTier}) returned ${retryText.length} chars, parses as JSON: ${retryLooksRight}`)
