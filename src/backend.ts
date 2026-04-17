@@ -1360,6 +1360,7 @@ function attachStreamObserver(chatId: string): void {
           }
 
           try {
+            spindle.log.info(`[SP] Retry (${currentTier}) sending with currentUserId=${String(currentUserId ?? '(empty)')}`)
             const retryResult = await (spindle.generate.raw as any)({
               messages: retryMessages as any,
               parameters: retryParams,
