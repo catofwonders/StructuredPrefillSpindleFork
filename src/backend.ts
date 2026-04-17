@@ -151,7 +151,7 @@ async function loadCompatCache(): Promise<void> {
   try {
     // Migration-tolerant load: accept either old-format string[] (legacy) or
     // new-format { connectionId: tier }. Old-format entries become 'json_object'.
-    const stored = await spindle.userStorage.getJson<unknown>(BLOCKLIST_FILE, { fallback: {} })
+    const stored = await spindle.userStorage.getJson<unknown>(BLOCKLIST_FILE, { fallback: {}, userId: currentUserId })
     compatCache.clear()
     if (Array.isArray(stored)) {
       for (const id of stored) {
@@ -178,7 +178,7 @@ async function persistCompatCache(): Promise<void> {
   try {
     const obj: Record<string, CompatTier> = {}
     for (const [k, v] of compatCache.entries()) obj[k] = v
-    await spindle.userStorage.setJson(BLOCKLIST_FILE, obj, { indent: 2 })
+    await spindle.userStorage.setJson(BLOCKLIST_FILE, obj, { indent: 2, userId: currentUserId })
   } catch (err) {
     spindle.log.warn(`[SP] Could not persist compat cache: ${err}`)
   }
@@ -207,6 +207,7 @@ async function loadSettings(): Promise<void> {
     // Use userStorage (per-user) instead of storage (shared) for operator-scoped compatibility
     settings = await spindle.userStorage.getJson<Settings>('settings.json', {
       fallback: { ...DEFAULT_SETTINGS },
+      userId: currentUserId,
     })
     // Merge missing keys from defaults
     for (const [key, value] of Object.entries(DEFAULT_SETTINGS)) {
@@ -224,7 +225,7 @@ async function loadSettings(): Promise<void> {
 
 async function saveSettings(): Promise<void> {
   try {
-    await spindle.userStorage.setJson('settings.json', settings, { indent: 2 })
+    await spindle.userStorage.setJson('settings.json', settings, { indent: 2, userId: currentUserId })
   } catch (err) {
     spindle.log.error(`[SP] Failed to save settings: ${err}`)
   }
@@ -1177,7 +1178,7 @@ spindle.registerInterceptor(async (messages: LlmMessageDTO[], context: any) => {
     hidePrefill: settings.hide_prefill_in_display,
     providerMode,
     injectionMode: state.activeInjectionMode,
-  })
+  }, currentUserId)
 
   // Return InterceptorResultDTO — messages + parameters.
   // Requires the "generation_parameters" permission; without it parameters are
@@ -1250,7 +1251,7 @@ function attachStreamObserver(chatId: string): void {
         chatId: state.activeChatId,
         decodedText: displayText,
         rawIsJson: true,
-      })
+      }, currentUserId)
     }
 
     maybeAbortOnStreamLoop(rawText, unwrapped)
@@ -1275,10 +1276,15 @@ function attachStreamObserver(chatId: string): void {
       spindle.log.info(`[SP] result.content length: ${String(result?.content ?? '').length} chars`)
 
       // ─── Auto-fallback: climb the compatibility tier ladder ───
-      // If the current tier returned empty content (and we aren't on tier 3
-      // already), retry via spindle.generate.raw() with the next tier until
-      // one returns content or we run out of tiers. Cache the working tier
-      // so future messages skip straight to it.
+      // Failure mode 1: empty content (proxy rejected the request outright)
+      // Failure mode 2: content came through but isn't our {"response":"..."}
+      //                 shape — means the proxy silently stripped the parameter
+      //                 and the model just chatted normally
+      //
+      // Prompt-only tier is treated as the terminal tier: if we're on it and
+      // the model returned plain prose instead of JSON, we accept the plain
+      // prose (the proxy stripped no parameter; it's the model not following
+      // the system-nudge). No more tiers to try.
       const isOpenAITier =
         state.activeInjectionMode === 'json_schema' ||
         state.activeInjectionMode === 'json_object' ||
@@ -1287,27 +1293,48 @@ function attachStreamObserver(chatId: string): void {
       let tierAtStart: CompatTier | null = null
       if (isOpenAITier) tierAtStart = state.activeInjectionMode as CompatTier
 
+      function looksLikeOurJson(text: string): boolean {
+        if (!text) return false
+        // Quick shape check — does it look like {"response":"..."}?
+        // We use the unwrapper since it handles partial/loose JSON too.
+        const out = tryUnwrapStructuredOutput(text)
+        return typeof out === 'string'
+      }
+
+      const initialLooksRight = looksLikeOurJson(rawText)
+      const initialIsFailure = rawText.length === 0 || !initialLooksRight
+
       const shouldRetry =
         !!tierAtStart &&
-        rawText.length === 0 &&
-        state.accumulatedStreamText.length === 0 &&
-        !!state.activeConnectionId
+        initialIsFailure &&
+        !!state.activeConnectionId &&
+        tierAtStart !== 'prompt_only'   // don't retry past the terminal tier
+
+      if (initialIsFailure && !shouldRetry) {
+        if (rawText.length > 0 && !initialLooksRight) {
+          spindle.log.warn(`[SP] Got ${rawText.length} chars of plain text on prompt_only tier — applying raw (the model didn't follow the JSON instruction)`)
+        }
+      }
 
       if (shouldRetry && tierAtStart) {
+        if (rawText.length > 0) {
+          spindle.log.warn(`[SP] Got ${rawText.length} chars but not in our JSON shape — proxy likely stripped ${tierAtStart} parameter. Falling through the ladder.`)
+        }
+
         let currentTier: CompatTier | null = tierAtStart
         let toastShown = false
 
-        while (rawText.length === 0 && currentTier) {
+        while (currentTier) {
           const nt = nextTier(currentTier)
           if (!nt) break
           currentTier = nt
 
-          spindle.log.warn(`[SP] Empty content on connection ${state.activeConnectionId} — trying fallback tier: ${currentTier}`)
+          spindle.log.warn(`[SP] Trying fallback tier: ${currentTier} on connection ${state.activeConnectionId}`)
 
           if (!toastShown) {
             try {
               spindle.toast.warning(
-                `This connection doesn't support ${tierAtStart} — falling back to ${currentTier} mode. Future messages on this connection will use the working mode automatically.`,
+                `This connection's ${tierAtStart} mode isn't working — falling back to ${currentTier}. Future messages will use the working mode automatically.`,
                 { title: EXT_NAME, duration: 9000 }
               )
             } catch { /* toast best-effort */ }
@@ -1338,9 +1365,14 @@ function attachStreamObserver(chatId: string): void {
               parameters: retryParams,
               connection_id: state.activeConnectionId,
             })
-            rawText = String((retryResult as any)?.content ?? '')
-            spindle.log.info(`[SP] Retry (${currentTier}) returned ${rawText.length} chars`)
-            if (rawText.length > 0) {
+            const retryText = String((retryResult as any)?.content ?? '')
+            const retryLooksRight = looksLikeOurJson(retryText)
+            spindle.log.info(`[SP] Retry (${currentTier}) returned ${retryText.length} chars, parses as JSON: ${retryLooksRight}`)
+
+            if (retryText.length > 0 && (retryLooksRight || currentTier === 'prompt_only')) {
+              // Success — take this result. prompt_only accepts plain prose
+              // as best-effort since it has no structured-output guarantee.
+              rawText = retryText
               await setCompatTier(state.activeConnectionId, currentTier)
               break
             }
@@ -1351,7 +1383,6 @@ function attachStreamObserver(chatId: string): void {
 
         if (rawText.length === 0) {
           spindle.log.warn(`[SP] All compatibility tiers exhausted — connection may be broken`)
-          // Record the deepest tier we tried so we don't repeat tier 1 every time
           if (currentTier) await setCompatTier(state.activeConnectionId, currentTier)
         }
       }
@@ -1388,7 +1419,7 @@ function attachStreamObserver(chatId: string): void {
         chatId: state.activeChatId,
         decodedText: displayText,
         fullText: finalText,
-      })
+      }, currentUserId)
     } finally {
       state.active = false
       clearHidePrefillState()
@@ -1413,7 +1444,7 @@ function attachStreamObserver(chatId: string): void {
         chatId: state.activeChatId,
         decodedText: displayText,
         fullText: finalText,
-      })
+      }, currentUserId)
     } finally {
       state.active = false
       clearHidePrefillState()
@@ -1440,7 +1471,7 @@ spindle.onFrontendMessage(async (payload: any, userId) => {
 
   switch (payload?.type) {
     case 'get_settings': {
-      spindle.sendToFrontend({ type: 'settings', settings })
+      spindle.sendToFrontend({ type: 'settings', settings }, userId)
       break
     }
 
@@ -1449,7 +1480,7 @@ spindle.onFrontendMessage(async (payload: any, userId) => {
       if (updates && typeof updates === 'object') {
         Object.assign(settings, updates)
         await saveSettings()
-        spindle.sendToFrontend({ type: 'settings', settings })
+        spindle.sendToFrontend({ type: 'settings', settings }, userId)
       }
       break
     }
@@ -1458,10 +1489,10 @@ spindle.onFrontendMessage(async (payload: any, userId) => {
       try {
         // Pass userId for operator-scoped extensions
         const connections = await spindle.connections.list(currentUserId)
-        spindle.sendToFrontend({ type: 'connections', connections })
+        spindle.sendToFrontend({ type: 'connections', connections }, userId)
       } catch (err) {
         spindle.log.warn(`[SP] Failed to list connections: ${err}`)
-        spindle.sendToFrontend({ type: 'connections', connections: [] })
+        spindle.sendToFrontend({ type: 'connections', connections: [] }, userId)
       }
       break
     }
@@ -1474,19 +1505,19 @@ spindle.onFrontendMessage(async (payload: any, userId) => {
         active: state.active,
         patternMode: state.patternMode,
         compatCache: compatEntries,
-      })
+      }, userId)
       break
     }
 
     case 'clear_blocklist': {
       compatCache.clear()
       try {
-        await spindle.userStorage.setJson(BLOCKLIST_FILE, {}, { indent: 2 })
+        await spindle.userStorage.setJson(BLOCKLIST_FILE, {}, { indent: 2, userId: currentUserId })
         spindle.log.info(`[SP] Cleared connection compatibility cache`)
       } catch (err) {
         spindle.log.warn(`[SP] Could not clear cache: ${err}`)
       }
-      spindle.sendToFrontend({ type: 'blocklist_cleared' })
+      spindle.sendToFrontend({ type: 'blocklist_cleared' }, userId)
       break
     }
 
@@ -1499,7 +1530,7 @@ spindle.onFrontendMessage(async (payload: any, userId) => {
       }
       const compatEntries: Record<string, CompatTier> = {}
       for (const [k, v] of compatCache.entries()) compatEntries[k] = v
-      spindle.sendToFrontend({ type: 'blocklist', compatCache: compatEntries })
+      spindle.sendToFrontend({ type: 'blocklist', compatCache: compatEntries }, userId)
       break
     }
   }
