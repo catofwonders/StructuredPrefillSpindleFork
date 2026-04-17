@@ -1004,9 +1004,15 @@ spindle.registerInterceptor(async (messages: LlmMessageDTO[], context: any) => {
   while (tailIndex >= 0 && messages[tailIndex]?.role === 'system') tailIndex--
   const tail = tailIndex >= 0 ? messages[tailIndex] : null
 
-  if (!tail || tail.role !== 'assistant' || typeof tail.content !== 'string') return messages
+  if (!tail || tail.role !== 'assistant' || typeof tail.content !== 'string') {
+    spindle.log.info(`[SP] No assistant-role tail message found — structured prefill not applicable to this turn`)
+    return messages
+  }
   let tailContent = tail.content
-  if (!tailContent) return messages
+  if (!tailContent) {
+    spindle.log.info(`[SP] Tail assistant message is empty — skipping`)
+    return messages
+  }
 
   // Strip character name prefix (e.g. "CharName: ") from the tail
   const sortedNames = [...state.knownNames].sort((a, b) => b.length - a.length)
@@ -1209,17 +1215,37 @@ spindle.registerInterceptor(async (messages: LlmMessageDTO[], context: any) => {
 type ActiveObserver = ReturnType<typeof spindle.generate.observe>
 const activeObservers: Map<string, ActiveObserver> = new Map()
 
-function disposeObserverFor(chatId: string): void {
+function disposeObserverFor(chatId: string, reason?: string): void {
   const existing = activeObservers.get(chatId)
   if (existing) {
     try { existing.dispose() } catch { /* ignore */ }
     activeObservers.delete(chatId)
+    if (reason) spindle.log.info(`[SP] Disposed observer for chat ${chatId} (${reason})`)
   }
+}
+
+function resetActiveGenerationState(reason: string): void {
+  if (state.active) {
+    spindle.log.info(`[SP] Clearing active generation state: ${reason}`)
+  }
+  state.active = false
+  state.accumulatedStreamText = ''
+  state.lastAppliedText = ''
+  state.activeGenerationId = ''
+  state.retryMessages = []
+  clearHidePrefillState()
+  clearContinueState()
+  resetStreamGuard()
 }
 
 function attachStreamObserver(chatId: string): void {
   if (!chatId) return
-  disposeObserverFor(chatId)
+  // If we had a prior observer and state for this chat, fully reset before
+  // attaching the new one — prevents a disposed-mid-stream observer's state
+  // from poisoning the new generation's delete/replace or blocking the
+  // interceptor from firing fresh.
+  disposeObserverFor(chatId, 'attaching new observer')
+  resetActiveGenerationState('new generation starting')
 
   const observer = spindle.generate.observe(chatId)
   activeObservers.set(chatId, observer)
@@ -1432,14 +1458,23 @@ function attachStreamObserver(chatId: string): void {
 
       spindle.log.info(`[SP] Final decoded text: ${finalText.length} chars, display: ${displayText.length} chars`)
 
-      if (result?.messageId && state.activeChatId) {
+      // Safety: if the payload's chatId doesn't match our closure's chatId,
+      // this is a stale event from a disposed observer — abort before touching
+      // any messages.
+      const eventChatId = String(result?.chatId ?? '')
+      if (eventChatId && eventChatId !== chatId) {
+        spindle.log.warn(`[SP] onEnd fired with stale chatId ${eventChatId} (expected ${chatId}) — skipping message write`)
+        return
+      }
+
+      if (result?.messageId && chatId) {
         try {
           const granted = await spindle.permissions.getGranted()
           if (granted.includes('chat_mutation')) {
             // First update the stored content (cheap — in case delete/append fails we still
             // have the decoded text on disk).
             try {
-              await (spindle as any).chat.updateMessage(state.activeChatId, result.messageId, { content: finalText })
+              await (spindle as any).chat.updateMessage(chatId, result.messageId, { content: finalText })
               spindle.log.info(`[SP] Stored decoded text on message ${result.messageId}`)
             } catch (err) {
               spindle.log.warn(`[SP] updateMessage failed (continuing to delete/replace): ${err}`)
@@ -1450,8 +1485,8 @@ function attachStreamObserver(chatId: string): void {
             // visible in chat" issue on prompt_only tier where Lumiverse doesn't know
             // the stream was JSON-wrapped.
             try {
-              await (spindle as any).chat.deleteMessage(state.activeChatId, result.messageId)
-              const appended = await (spindle as any).chat.appendMessage(state.activeChatId, {
+              await (spindle as any).chat.deleteMessage(chatId, result.messageId)
+              const appended = await (spindle as any).chat.appendMessage(chatId, {
                 role: 'assistant',
                 content: finalText,
                 metadata: { source: 'structured_prefill_rerender', originalMessageId: result.messageId },
@@ -1470,7 +1505,7 @@ function attachStreamObserver(chatId: string): void {
 
       spindle.sendToFrontend({
         type: 'sp_generation_complete',
-        chatId: state.activeChatId,
+        chatId,
         decodedText: displayText,
         fullText: finalText,
       }, currentUserId)
