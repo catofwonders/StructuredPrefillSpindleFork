@@ -30,7 +30,7 @@ The extension doesn't know what your provider supports, so it probes automatical
 1. **First message:** tries the strongest mode (json_schema for OpenAI-compatible)
 2. **If that fails:** retries with json_object, then prompt-only
 3. **Caches the result:** future messages skip straight to the working mode
-4. **Server errors (500, timeouts) don't trigger fallback** — the extension distinguishes between "proxy doesn't support this feature" and "server is temporarily down"
+4. **Server errors (500, timeouts) don't trigger fallback** — the extension distinguishes between "provider doesn't support this feature" and "server is temporarily down"
 
 A **Reset Connection Compatibility** button in the extension settings lets you clear the cache and re-probe from scratch.
 
