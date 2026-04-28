@@ -25,7 +25,7 @@ This is especially useful for:
 
 ## Automatic compatibility detection
 
-The extension doesn't know what your proxy supports, so it probes automatically:
+The extension doesn't know what your provider supports, so it probes automatically:
 
 1. **First message:** tries the strongest mode (json_schema for OpenAI-compatible)
 2. **If that fails:** retries with json_object, then prompt-only
