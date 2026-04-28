@@ -200,27 +200,29 @@ function getCompatTier(connectionId: string): CompatTier {
 // ─── Settings I/O ────────────────────────────────────────────────────────────
 
 let settingsLoaded = false
+let settingsLoadPromise: Promise<void> | null = null
 
 async function loadSettings(): Promise<void> {
   if (settingsLoaded) return
-  try {
-    // Use userStorage (per-user) instead of storage (shared) for operator-scoped compatibility
-    settings = await spindle.userStorage.getJson<Settings>('settings.json', {
-      fallback: { ...DEFAULT_SETTINGS },
-      userId: currentUserId,
-    })
-    // Merge missing keys from defaults
-    for (const [key, value] of Object.entries(DEFAULT_SETTINGS)) {
-      if ((settings as any)[key] == null) {
-        ;(settings as any)[key] = value
+  if (settingsLoadPromise) return settingsLoadPromise
+  settingsLoadPromise = (async () => {
+    try {
+      settings = await spindle.userStorage.getJson<Settings>('settings.json', {
+        fallback: { ...DEFAULT_SETTINGS },
+        userId: currentUserId,
+      })
+      for (const [key, value] of Object.entries(DEFAULT_SETTINGS)) {
+        if ((settings as any)[key] == null) {
+          ;(settings as any)[key] = value
+        }
       }
+      settingsLoaded = true
+    } catch {
+      settings = { ...DEFAULT_SETTINGS }
     }
-    settingsLoaded = true
-  } catch {
-    settings = { ...DEFAULT_SETTINGS }
-  }
-  // Load the compatibility cache alongside settings
-  await loadCompatCache()
+    await loadCompatCache()
+  })()
+  return settingsLoadPromise
 }
 
 async function saveSettings(): Promise<void> {
@@ -260,6 +262,25 @@ function looksLikeStructuredJsonBlob(text: string): boolean {
   const s = String(text ?? '')
   if (!s.includes('{') || !s.includes('"')) return false
   return /\{\s*"(?:response|value|prefix|content)"\s*:/.test(s)
+}
+
+// Detect model refusal responses so we don't wrongly demote a working tier.
+// These are content-policy rejections, not proxy failures.
+function looksLikeModelRefusal(text: string): boolean {
+  const s = String(text ?? '').trim().toLowerCase()
+  if (s.length === 0 || s.length > 800) return false // refusals are short
+  const patterns = [
+    /^i('m| am) (unable|not able|sorry|afraid)/,
+    /^i (can't|cannot|won't|will not) (assist|help|generate|create|produce|write|comply)/,
+    /^sorry,? (but )?(i |this )/,
+    /^i (can't|cannot) (fulfill|complete|process) (this|that|your)/,
+    /^this (request|content|prompt) (is |goes |violates )/,
+    /^as an ai/,
+    /content policy/,
+    /against (my|our) (guidelines|policy|policies)/,
+    /not (able|going) to (generate|create|write|produce|assist)/,
+  ]
+  return patterns.some(p => p.test(s))
 }
 
 // ─── Newline Token Handling ──────────────────────────────────────────────────
@@ -1281,7 +1302,7 @@ function attachStreamObserver(chatId: string): void {
 
       spindle.sendToFrontend({
         type: 'sp_stream_update',
-        chatId: state.activeChatId,
+        chatId,
         decodedText: displayText,
         rawIsJson: true,
       }, currentUserId)
@@ -1301,12 +1322,9 @@ function attachStreamObserver(chatId: string): void {
       // event payload's content field for some providers).
       let rawText = String(result?.content ?? observer.content ?? state.accumulatedStreamText ?? '')
 
-      // ─── Diagnostic: what did the provider actually return? ───
-      const preview = rawText.length > 300 ? rawText.slice(0, 300) + '...' : rawText
-      spindle.log.info(`[SP] Raw response (${rawText.length} chars): ${JSON.stringify(preview)}`)
-      spindle.log.info(`[SP] Tokens accumulated during stream: ${state.accumulatedStreamText.length} chars`)
-      spindle.log.info(`[SP] Observer.content length: ${String(observer.content ?? '').length} chars`)
-      spindle.log.info(`[SP] result.content length: ${String(result?.content ?? '').length} chars`)
+      // ─── Diagnostic ───
+      const preview = rawText.length > 200 ? rawText.slice(0, 200) + '...' : rawText
+      spindle.log.info(`[SP] Raw response (${rawText.length} chars, stream=${state.accumulatedStreamText.length}, observer=${String(observer.content ?? '').length}): ${JSON.stringify(preview)}`)
 
       // ─── Auto-fallback: climb the compatibility tier ladder ───
       // Failure mode 1: empty content (proxy rejected the request outright)
@@ -1314,10 +1332,13 @@ function attachStreamObserver(chatId: string): void {
       //                 shape — means the proxy silently stripped the parameter
       //                 and the model just chatted normally
       //
-      // Prompt-only tier is treated as the terminal tier: if we're on it and
-      // the model returned plain prose instead of JSON, we accept the plain
-      // prose (the proxy stripped no parameter; it's the model not following
-      // the system-nudge). No more tiers to try.
+      // IMPORTANT: If the current tier was ALREADY CACHED as working (not a
+      // first-probe), we do NOT demote on non-JSON responses. A cached tier
+      // that previously returned valid JSON is assumed to still work; a non-JSON
+      // response is likely a model refusal or content-policy block, not a proxy
+      // failure. Demoting on refusal would wrongly push us to a weaker tier.
+      //
+      // We also detect obvious refusal phrases and skip the ladder entirely.
       const isOpenAITier =
         state.activeInjectionMode === 'json_schema' ||
         state.activeInjectionMode === 'json_object' ||
@@ -1328,30 +1349,49 @@ function attachStreamObserver(chatId: string): void {
 
       function looksLikeOurJson(text: string): boolean {
         if (!text) return false
-        // Quick shape check — does it look like {"response":"..."}?
-        // We use the unwrapper since it handles partial/loose JSON too.
         const out = tryUnwrapStructuredOutput(text)
         return typeof out === 'string'
       }
 
       const initialLooksRight = looksLikeOurJson(rawText)
-      const initialIsFailure = rawText.length === 0 || !initialLooksRight
+      const initialIsEmpty = rawText.length === 0
+      const initialIsRefusal = !initialIsEmpty && !initialLooksRight && looksLikeModelRefusal(rawText)
+
+      // Was this tier already cached as working? If so, a non-JSON non-empty
+      // response is NOT a signal to demote — it's the model refusing content.
+      const tierWasCached = !!state.activeConnectionId && compatCache.has(state.activeConnectionId)
 
       const shouldRetry =
         !!tierAtStart &&
-        initialIsFailure &&
+        (initialIsEmpty || (!initialLooksRight && !tierWasCached && !initialIsRefusal)) &&
         !!state.activeConnectionId &&
-        tierAtStart !== 'prompt_only'   // don't retry past the terminal tier
+        tierAtStart !== 'prompt_only'
 
-      if (initialIsFailure && !shouldRetry) {
-        if (rawText.length > 0 && !initialLooksRight) {
-          spindle.log.warn(`[SP] Got ${rawText.length} chars of plain text on prompt_only tier — applying raw (the model didn't follow the JSON instruction)`)
-        }
+      if (initialIsRefusal) {
+        spindle.log.info(`[SP] Response looks like a model refusal — accepting as-is, not demoting tier`)
+      } else if (!initialLooksRight && !initialIsEmpty && tierWasCached) {
+        spindle.log.info(`[SP] Got non-JSON response on cached tier ${tierAtStart} — likely model refusal or content filter. Keeping cached tier.`)
+      } else if (!initialLooksRight && !initialIsEmpty && !shouldRetry) {
+        spindle.log.warn(`[SP] Got ${rawText.length} chars of plain text on ${tierAtStart ?? 'unknown'} tier — applying raw`)
       }
 
       if (shouldRetry && tierAtStart) {
         if (rawText.length > 0) {
           spindle.log.warn(`[SP] Got ${rawText.length} chars but not in our JSON shape — proxy likely stripped ${tierAtStart} parameter. Falling through the ladder.`)
+        }
+
+        // Resolve connection model+provider once for all retry attempts
+        let retryProvider = ''
+        let retryModel = ''
+        try {
+          const conn = await spindle.connections.get(state.activeConnectionId, currentUserId)
+          if (conn) {
+            retryProvider = String(conn.provider ?? '')
+            retryModel = String(conn.model ?? '')
+            spindle.log.info(`[SP] Retry resolved model=${retryModel} provider=${retryProvider}`)
+          }
+        } catch (err) {
+          spindle.log.warn(`[SP] Retry could not resolve connection: ${err}`)
         }
 
         let currentTier: CompatTier | null = tierAtStart
@@ -1393,24 +1433,6 @@ function attachStreamObserver(chatId: string): void {
           }
 
           try {
-            spindle.log.info(`[SP] Retry (${currentTier}) sending with currentUserId=${String(currentUserId ?? '(empty)')}`)
-
-            // Resolve the connection's model and provider so we can pass them
-            // explicitly — `generate.raw` doesn't auto-resolve from connection_id
-            // the way the main generation pipeline does.
-            let retryProvider = ''
-            let retryModel = ''
-            try {
-              const conn = await spindle.connections.get(state.activeConnectionId, currentUserId)
-              if (conn) {
-                retryProvider = String(conn.provider ?? '')
-                retryModel = String(conn.model ?? '')
-                spindle.log.info(`[SP] Retry resolved model=${retryModel} provider=${retryProvider}`)
-              }
-            } catch (err) {
-              spindle.log.warn(`[SP] Retry could not resolve connection: ${err}`)
-            }
-
             const retryRequest: Record<string, unknown> = {
               messages: retryMessages as any,
               parameters: retryParams,
@@ -1418,7 +1440,6 @@ function attachStreamObserver(chatId: string): void {
               userId: currentUserId,
               user_id: currentUserId,
             }
-            // Cover both common field names — runtime ignores the unused one
             if (retryModel) {
               retryRequest.model = retryModel
               ;(retryRequest.parameters as any).model = retryModel
@@ -1525,7 +1546,7 @@ function attachStreamObserver(chatId: string): void {
     }
   })
 
-  observer.onStop((result: any) => {
+  observer.onStop(async (result: any) => {
     try {
       if (!state.active) return
       const rawText = String(result?.content ?? observer.content ?? state.accumulatedStreamText ?? '')
@@ -1533,9 +1554,41 @@ function attachStreamObserver(chatId: string): void {
       const finalText = typeof unwrapped === 'string' ? unwrapped : state.lastAppliedText || rawText
       const displayText = stripHidePrefill(finalText)
 
+      // Stale-chatId guard (same as onEnd)
+      const eventChatId = String(result?.chatId ?? '')
+      if (eventChatId && eventChatId !== chatId) {
+        spindle.log.warn(`[SP] onStop fired with stale chatId ${eventChatId} (expected ${chatId}) — skipping message write`)
+        return
+      }
+
+      // Apply decoded text + delete-and-replace (same as onEnd)
+      if (result?.messageId && chatId) {
+        try {
+          const granted = await spindle.permissions.getGranted()
+          if (granted.includes('chat_mutation')) {
+            try {
+              await (spindle as any).chat.updateMessage(chatId, result.messageId, { content: finalText })
+            } catch { /* best-effort store */ }
+            try {
+              await (spindle as any).chat.deleteMessage(chatId, result.messageId)
+              const appended = await (spindle as any).chat.appendMessage(chatId, {
+                role: 'assistant',
+                content: finalText,
+                metadata: { source: 'structured_prefill_rerender', originalMessageId: result.messageId },
+              })
+              spindle.log.info(`[SP] onStop: Replaced message ${result.messageId} with fresh render (new id: ${appended?.id ?? '?'})`)
+            } catch (err) {
+              spindle.log.warn(`[SP] onStop: Delete+append failed: ${err}`)
+            }
+          }
+        } catch (err) {
+          spindle.log.warn(`[SP] onStop: Failed to apply decoded text: ${err}`)
+        }
+      }
+
       spindle.sendToFrontend({
         type: 'sp_generation_complete',
-        chatId: state.activeChatId,
+        chatId,
         decodedText: displayText,
         fullText: finalText,
       }, currentUserId)
