@@ -1324,8 +1324,9 @@ function attachStreamObserver(chatId: string): void {
   observer.onEnd(async (result: any) => {
     try {
       if (!state.active) return
-      if (result?.error) {
-        spindle.log.warn(`[SP] Generation ended with error: ${result.error}`)
+      const generationError = result?.error ? String(result.error) : ''
+      if (generationError) {
+        spindle.log.warn(`[SP] Generation ended with error: ${generationError}`)
       }
 
       // Prefer the observer's accumulated content (more reliable than the
@@ -1335,6 +1336,32 @@ function attachStreamObserver(chatId: string): void {
       // ─── Diagnostic ───
       const preview = rawText.length > 200 ? rawText.slice(0, 200) + '...' : rawText
       spindle.log.info(`[SP] Raw response (${rawText.length} chars, stream=${state.accumulatedStreamText.length}, observer=${String(observer.content ?? '').length}): ${JSON.stringify(preview)}`)
+
+      // If the generation ended with a server error (500, model unavailable,
+      // timeout, etc.), do NOT enter the retry ladder. The failure is the
+      // server's problem, not a structured-output compatibility issue.
+      // Accept whatever we have and keep the cached tier unchanged.
+      if (generationError) {
+        spindle.log.info(`[SP] Server error detected — skipping tier ladder, keeping cached tier unchanged`)
+        const unwrapped = tryUnwrapStructuredOutput(rawText)
+        const finalText = typeof unwrapped === 'string' ? unwrapped : rawText
+        const displayText = stripHidePrefill(finalText)
+        state.lastAppliedText = finalText
+
+        if (finalText.length > 0 && result?.messageId && chatId) {
+          try {
+            await (spindle as any).chat.updateMessage(chatId, result.messageId, { content: finalText })
+          } catch { /* best effort */ }
+        }
+
+        spindle.sendToFrontend({
+          type: 'sp_generation_complete',
+          chatId,
+          decodedText: displayText,
+          fullText: finalText,
+        }, currentUserId)
+        return // skip the rest of onEnd
+      }
 
       // ─── Auto-fallback: climb the compatibility tier ladder ───
       // Failure mode 1: empty content (proxy rejected the request outright)
