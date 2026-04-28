@@ -1497,8 +1497,7 @@ function attachStreamObserver(chatId: string): void {
         try {
           const granted = await spindle.permissions.getGranted()
           if (granted.includes('chat_mutation')) {
-            // First update the stored content (cheap — in case delete/append fails we still
-            // have the decoded text on disk).
+            // Always store the decoded text first
             try {
               await (spindle as any).chat.updateMessage(chatId, result.messageId, { content: finalText })
               spindle.log.info(`[SP] Stored decoded text on message ${result.messageId}`)
@@ -1506,20 +1505,32 @@ function attachStreamObserver(chatId: string): void {
               spindle.log.warn(`[SP] updateMessage failed (continuing to delete/replace): ${err}`)
             }
 
-            // Now delete + re-append so Lumiverse re-renders from scratch instead of
-            // showing the cached raw JSON stream. This fixes the "JSON wrapper still
-            // visible in chat" issue on prompt_only tier where Lumiverse doesn't know
-            // the stream was JSON-wrapped.
-            try {
-              await (spindle as any).chat.deleteMessage(chatId, result.messageId)
-              const appended = await (spindle as any).chat.appendMessage(chatId, {
-                role: 'assistant',
-                content: finalText,
-                metadata: { source: 'structured_prefill_rerender', originalMessageId: result.messageId },
-              })
-              spindle.log.info(`[SP] Replaced message ${result.messageId} with fresh render (new id: ${appended?.id ?? '?'})`)
-            } catch (err) {
-              spindle.log.warn(`[SP] Delete+append failed — message kept with raw content: ${err}`)
+            // Only delete + re-append if we actually transformed the content
+            // (stripped a JSON wrapper). If rawText === finalText, the streamed
+            // content was already clean — updateMessage is sufficient and we
+            // avoid the blink + potential append failures.
+            const contentWasTransformed = rawText !== finalText
+            if (contentWasTransformed) {
+              try {
+                // APPEND FIRST, then delete. If append fails, the original
+                // message stays with updated clean content from updateMessage.
+                // Never delete before we know the replacement exists.
+                const appended = await (spindle as any).chat.appendMessage(chatId, {
+                  role: 'assistant',
+                  content: finalText,
+                })
+                if (appended?.id) {
+                  // Append succeeded — safe to remove the JSON-wrapped original
+                  await (spindle as any).chat.deleteMessage(chatId, result.messageId)
+                  spindle.log.info(`[SP] Replaced message ${result.messageId} with fresh render (new id: ${appended.id})`)
+                } else {
+                  spindle.log.warn(`[SP] appendMessage returned no id — keeping original message with updated content`)
+                }
+              } catch (err) {
+                spindle.log.warn(`[SP] Append+delete failed — original message kept with stored clean content: ${err}`)
+              }
+            } else {
+              spindle.log.info(`[SP] Content unchanged after decode — updateMessage is sufficient, skipping replace`)
             }
           } else {
             spindle.log.info(`[SP] chat_mutation not granted — decoded text sent to frontend only`)
@@ -1561,7 +1572,7 @@ function attachStreamObserver(chatId: string): void {
         return
       }
 
-      // Apply decoded text + delete-and-replace (same as onEnd)
+      // Apply decoded text + conditional delete-and-replace
       if (result?.messageId && chatId) {
         try {
           const granted = await spindle.permissions.getGranted()
@@ -1569,16 +1580,23 @@ function attachStreamObserver(chatId: string): void {
             try {
               await (spindle as any).chat.updateMessage(chatId, result.messageId, { content: finalText })
             } catch { /* best-effort store */ }
-            try {
-              await (spindle as any).chat.deleteMessage(chatId, result.messageId)
-              const appended = await (spindle as any).chat.appendMessage(chatId, {
-                role: 'assistant',
-                content: finalText,
-                metadata: { source: 'structured_prefill_rerender', originalMessageId: result.messageId },
-              })
-              spindle.log.info(`[SP] onStop: Replaced message ${result.messageId} with fresh render (new id: ${appended?.id ?? '?'})`)
-            } catch (err) {
-              spindle.log.warn(`[SP] onStop: Delete+append failed: ${err}`)
+
+            const contentWasTransformed = rawText !== finalText
+            if (contentWasTransformed) {
+              try {
+                const appended = await (spindle as any).chat.appendMessage(chatId, {
+                  role: 'assistant',
+                  content: finalText,
+                })
+                if (appended?.id) {
+                  await (spindle as any).chat.deleteMessage(chatId, result.messageId)
+                  spindle.log.info(`[SP] onStop: Replaced message ${result.messageId} with fresh render (new id: ${appended.id})`)
+                } else {
+                  spindle.log.warn(`[SP] onStop: appendMessage returned no id — keeping original`)
+                }
+              } catch (err) {
+                spindle.log.warn(`[SP] onStop: Append+delete failed: ${err}`)
+              }
             }
           }
         } catch (err) {
