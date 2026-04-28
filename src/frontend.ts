@@ -229,7 +229,9 @@ function wireSettingsListeners(root: HTMLElement): void {
   root.querySelectorAll<HTMLButtonElement>('button[data-action]').forEach(button => {
     button.addEventListener('click', () => {
       const action = button.getAttribute('data-action')
+      console.log(`[SP Frontend] Button clicked: action=${action}`)
       if (action === 'reset_compat') {
+        console.log(`[SP Frontend] Sending clear_blocklist to backend`)
         ctx.sendToBackend({ type: 'clear_blocklist' })
         const status = root.querySelector<HTMLElement>('[data-compat-status]')
         if (status) status.textContent = 'Resetting…'

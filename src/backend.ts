@@ -1191,19 +1191,22 @@ spindle.registerInterceptor(async (messages: LlmMessageDTO[], context: any) => {
       parameters = {
         response_format: { type: 'json_object' },
       }
-      // Nudge the model since json_object has no schema
+      const prefillClause = state.expectedPrefill
+        ? `\n\nCRITICAL: The value of "response" MUST begin with the following text EXACTLY — copy it verbatim, do not paraphrase, skip, or summarize it:\n${state.expectedPrefill}`
+        : ''
       modifiedMessages.unshift({
         role: 'system',
-        content: 'You MUST respond with a JSON object of the form {"response": "your full reply as a single string"}. No other keys. No prose outside the JSON.',
+        content: `You MUST respond with a JSON object of the form {"response": "your full reply as a single string"}. No other keys. No prose outside the JSON.${prefillClause}`,
       })
     } else {
-      // prompt_only — no response_format at all, just a strong system nudge.
-      // This works on proxies that reject response_format entirely.
       spindle.log.info(`[SP] Using cached tier prompt_only for ${connectionId}`)
       parameters = {}
+      const prefillClause = state.expectedPrefill
+        ? `\n\nCRITICAL: The value of "response" MUST begin with the following text EXACTLY — copy it verbatim, do not paraphrase, skip, or summarize it:\n${state.expectedPrefill}`
+        : ''
       modifiedMessages.unshift({
         role: 'system',
-        content: 'CRITICAL: Your entire response must be a single JSON object of the form {"response":"your full reply as a single string, with all newlines escaped as \\n"}. Do not include any text before or after the JSON. Do not use markdown code fences. Start your reply with the literal character { and end with }.',
+        content: `Your entire response must be a single JSON object of the form {"response":"your full reply as a single string, with all newlines escaped as \\n"}. Do not include any text before or after the JSON. Do not use markdown code fences. Start with { and end with }.${prefillClause}`,
       })
     }
   }
@@ -1427,15 +1430,21 @@ function attachStreamObserver(chatId: string): void {
 
           if (currentTier === 'json_object') {
             retryParams = { response_format: { type: 'json_object' } }
+            const prefillClause = state.expectedPrefill
+              ? `\n\nCRITICAL: The value of "response" MUST begin with the following text EXACTLY — copy it verbatim, do not paraphrase, skip, or summarize it:\n${state.expectedPrefill}`
+              : ''
             retryMessages.unshift({
               role: 'system',
-              content: 'You MUST respond with a JSON object of the form {"response": "your full reply as a single string"}. No other keys. No prose outside the JSON.',
+              content: `You MUST respond with a JSON object of the form {"response": "your full reply as a single string"}. No other keys. No prose outside the JSON.${prefillClause}`,
             })
           } else if (currentTier === 'prompt_only') {
             retryParams = {}
+            const prefillClause = state.expectedPrefill
+              ? `\n\nCRITICAL: The value of "response" MUST begin with the following text EXACTLY — copy it verbatim, do not paraphrase, skip, or summarize it:\n${state.expectedPrefill}`
+              : ''
             retryMessages.unshift({
               role: 'system',
-              content: 'CRITICAL: Your entire response must be a single JSON object of the form {"response":"your full reply as a single string, with all newlines escaped as \\n"}. Do not include any text before or after the JSON. Do not use markdown code fences. Start your reply with the literal character { and end with }.',
+              content: `Your entire response must be a single JSON object of the form {"response":"your full reply as a single string, with all newlines escaped as \\n"}. Do not include any text before or after the JSON. Do not use markdown code fences. Start with { and end with }.${prefillClause}`,
             })
           }
 
@@ -1640,6 +1649,8 @@ spindle.onFrontendMessage(async (payload: any, userId) => {
 
   // Lazy-load settings on first message so userId is known (pattern from LumiScript)
   if (!settingsLoaded) await loadSettings()
+
+  spindle.log.info(`[SP] Frontend message received: type=${payload?.type}`)
 
   switch (payload?.type) {
     case 'get_settings': {
