@@ -966,6 +966,7 @@ async function runPrefillGenerator(messages: LlmMessageDTO[], tailIndex: number)
 // ─── Interceptor (Core Hook) ─────────────────────────────────────────────────
 
 spindle.registerInterceptor(async (messages: LlmMessageDTO[], context: any) => {
+  try {
   // Ensure settings are loaded (interceptor can fire before frontend connects)
   if (!settingsLoaded) await loadSettings()
   
@@ -1223,6 +1224,12 @@ spindle.registerInterceptor(async (messages: LlmMessageDTO[], context: any) => {
   return {
     messages: modifiedMessages,
     parameters,
+  }
+
+  } catch (err) {
+    spindle.log.error(`[SP] INTERCEPTOR EXCEPTION: ${err}`)
+    try { spindle.log.error(`[SP] Stack: ${(err as any)?.stack ?? 'no stack'}`) } catch { /* ignore */ }
+    return messages // fail-safe: return unmodified messages
   }
 }, 50) // High priority — run early
 
