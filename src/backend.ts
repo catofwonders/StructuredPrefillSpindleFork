@@ -194,8 +194,13 @@ async function setCompatTier(connectionId: string, tier: CompatTier): Promise<vo
 
 function getCompatTier(connectionId: string): CompatTier {
   if (!connectionId) return 'json_schema'
+  if (forceReprobe) return 'json_schema'
   return compatCache.get(connectionId) ?? 'json_schema'
 }
+
+// When set, the next interceptor call ignores the cached tier and probes
+// from json_schema. Reset after one use.
+let forceReprobe = false
 
 // ─── Settings I/O ────────────────────────────────────────────────────────────
 
@@ -1177,6 +1182,10 @@ spindle.registerInterceptor(async (messages: LlmMessageDTO[], context: any) => {
     // Tier 2: json_object (shape only)
     // Tier 3: prompt_only (no response_format; system nudge only)
     const tier = getCompatTier(connectionId)
+    if (forceReprobe) {
+      spindle.log.info(`[SP] Force re-probe active — starting from json_schema regardless of cache`)
+      forceReprobe = false
+    }
     state.activeInjectionMode = tier
 
     if (tier === 'json_schema') {
@@ -1721,9 +1730,10 @@ spindle.onFrontendMessage(async (payload: any, userId) => {
 
     case 'clear_blocklist': {
       compatCache.clear()
+      forceReprobe = true
       try {
         await spindle.userStorage.setJson(BLOCKLIST_FILE, {}, { indent: 2, userId: currentUserId })
-        spindle.log.info(`[SP] Cleared connection compatibility cache`)
+        spindle.log.info(`[SP] Cleared connection compatibility cache — next message will re-probe from json_schema`)
       } catch (err) {
         spindle.log.warn(`[SP] Could not clear cache: ${err}`)
       }
