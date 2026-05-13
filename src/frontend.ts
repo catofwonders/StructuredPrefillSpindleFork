@@ -7,6 +7,7 @@ interface Settings {
   min_chars_after_prefix: number
   continue_overlap_chars: number
   anti_slop_ban_list: string
+  tier_lock: string
   prefill_gen_enabled: boolean
   prefill_gen_extra_prompt: string
   prefill_gen_extra_prompt_role: string
@@ -49,6 +50,16 @@ function buildSettingsHtml(): string {
           <label class="sp-checkbox">
             <input type="checkbox" data-key="hide_prefill_in_display" ${s.hide_prefill_in_display ? 'checked' : ''}>
             <span>Hide prefill text in final message (use <code>[[keep]]</code> to keep tail visible)</span>
+          </label>
+          <label class="sp-field">
+            <span>Structured output mode</span>
+            <select data-key="tier_lock">
+              <option value="auto" ${(s.tier_lock ?? 'auto') === 'auto' ? 'selected' : ''}>Auto-detect</option>
+              <option value="json_schema" ${s.tier_lock === 'json_schema' ? 'selected' : ''}>json_schema (strongest — real OpenAI only)</option>
+              <option value="json_object" ${s.tier_lock === 'json_object' ? 'selected' : ''}>json_object (most proxies)</option>
+              <option value="prompt_only" ${s.tier_lock === 'prompt_only' ? 'selected' : ''}>Prompt only (works anywhere, weakest)</option>
+            </select>
+            <small>Auto-detect probes your connection and caches the result. Lock to a specific mode to prevent fallback switching.</small>
           </label>
         </div>
       </div>

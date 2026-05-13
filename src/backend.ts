@@ -9,6 +9,7 @@ interface Settings {
   min_chars_after_prefix: number
   continue_overlap_chars: number
   anti_slop_ban_list: string
+  tier_lock: 'auto' | 'json_schema' | 'json_object' | 'prompt_only'
   prefill_gen_enabled: boolean
   prefill_gen_extra_prompt: string
   prefill_gen_extra_prompt_role: string
@@ -67,6 +68,7 @@ const DEFAULT_SETTINGS: Settings = {
   min_chars_after_prefix: 80,
   continue_overlap_chars: 14,
   anti_slop_ban_list: '',
+  tier_lock: 'auto',
   prefill_gen_enabled: false,
   prefill_gen_extra_prompt: '',
   prefill_gen_extra_prompt_role: 'system',
@@ -1177,12 +1179,16 @@ spindle.registerInterceptor(async (messages: LlmMessageDTO[], context: any) => {
       responseSchema: buildPlainJsonSchemaForPrefill(),
     }
   } else {
-    // openai and openai-compatible — pick a tier from the compat cache.
-    // Tier 1: json_schema (regex-locked)
-    // Tier 2: json_object (shape only)
-    // Tier 3: prompt_only (no response_format; system nudge only)
-    const tier = getCompatTier(connectionId)
-    if (forceReprobe) {
+    // openai and openai-compatible — pick a tier.
+    // If tier_lock is set, use that unconditionally. Otherwise use the compat cache.
+    const isLocked = settings.tier_lock && settings.tier_lock !== 'auto'
+    const tier: CompatTier = isLocked
+      ? settings.tier_lock as CompatTier
+      : getCompatTier(connectionId)
+
+    if (isLocked) {
+      spindle.log.info(`[SP] Tier manually locked to ${tier}`)
+    } else if (forceReprobe) {
       spindle.log.info(`[SP] Force re-probe active — starting from json_schema regardless of cache`)
       forceReprobe = false
     }
@@ -1406,14 +1412,18 @@ function attachStreamObserver(chatId: string): void {
       // Was this tier already cached as working? If so, a non-JSON non-empty
       // response is NOT a signal to demote — it's the model refusing content.
       const tierWasCached = !!state.activeConnectionId && compatCache.has(state.activeConnectionId)
+      const tierIsLocked = settings.tier_lock && settings.tier_lock !== 'auto'
 
       const shouldRetry =
+        !tierIsLocked &&
         !!tierAtStart &&
         (initialIsEmpty || (!initialLooksRight && !tierWasCached && !initialIsRefusal)) &&
         !!state.activeConnectionId &&
         tierAtStart !== 'prompt_only'
 
-      if (initialIsRefusal) {
+      if (tierIsLocked && (initialIsEmpty || !initialLooksRight)) {
+        spindle.log.info(`[SP] Tier manually locked to ${settings.tier_lock} — no fallback, accepting response as-is`)
+      } else if (initialIsRefusal) {
         spindle.log.info(`[SP] Response looks like a model refusal — accepting as-is, not demoting tier`)
       } else if (!initialLooksRight && !initialIsEmpty && tierWasCached) {
         spindle.log.info(`[SP] Got non-JSON response on cached tier ${tierAtStart} — likely model refusal or content filter. Keeping cached tier.`)
