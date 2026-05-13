@@ -5,6 +5,7 @@
   "min_chars_after_prefix": 80,
   "continue_overlap_chars": 14,
   "anti_slop_ban_list": "",
+  "tier_lock": "auto",
   "prefill_gen_enabled": false,
   "prefill_gen_extra_prompt": "",
   "prefill_gen_extra_prompt_role": "system",
